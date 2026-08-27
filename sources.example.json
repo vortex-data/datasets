@@ -1,0 +1,18 @@
+[
+  {
+    "repo": "HuggingFaceFW/fineweb",
+    "revision": "main",
+    "prefix": "data",
+    "include": "*.parquet",
+    "filters": ["sample/10BT/*"],
+    "mode": "all"
+  },
+  {
+    "repo": "HuggingFaceFW/fineweb-edu",
+    "revision": "main",
+    "prefix": "data",
+    "mode": "sample",
+    "target_size": "10GB",
+    "seed": 0
+  }
+]
