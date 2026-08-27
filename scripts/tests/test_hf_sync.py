@@ -108,7 +108,7 @@ class DiffSelectionTest(unittest.TestCase):
 
 class SourcesTest(unittest.TestCase):
     def _args(self, **overrides):
-        argv = ["--dry-run"]
+        argv = ["plan", "--upload-repo", "vortex-data/mirror"]
         for key, value in overrides.items():
             argv.extend([key, value])
         return MODULE.parse_args(argv)
@@ -142,6 +142,84 @@ class SourcesTest(unittest.TestCase):
     def test_requires_at_least_one_source(self):
         with self.assertRaisesRegex(RuntimeError, "no sources"):
             MODULE.load_sources(self._args())
+
+
+class FakeApi:
+    """Hub stub: one source shard, empty destination."""
+
+    def __init__(self, shards=None):
+        self.shards = shards or [types.SimpleNamespace(path="data/a.parquet", size=10, lfs=None)]
+
+    def dataset_info(self, repo, revision=None, timeout=None):
+        return types.SimpleNamespace(sha="deadbeefdeadbeef")
+
+    def repo_info(self, repo, **kwargs):
+        return types.SimpleNamespace(xet_enabled=True)
+
+    def list_repo_tree(self, repo, **kwargs):
+        return list(self.shards)
+
+
+class PlanTest(unittest.TestCase):
+    def _plan(self, tmp):
+        sources = MODULE.load_sources(MODULE.parse_args(
+            ["plan", "--repo", "org/a", "--upload-local-dir", str(Path(tmp) / "sink")]))
+        destination = {"repo": None, "local_dir": str(Path(tmp) / "sink"),
+                       "revision": "main", "prefix": ""}
+        return MODULE.build_plan(FakeApi(), sources, destination,
+                                 ("vortex", "parquet-zstd6"), attempts=1, timeout=1)
+
+    def test_build_plan_lists_missing_chunks_with_sinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+        source = plan["sources"][0]
+        self.assertEqual(source["revision"], "deadbeefdeadbeef")
+        self.assertEqual(len(source["chunks"]), 1)
+        chunk = source["chunks"][0]
+        self.assertEqual(chunk["path"], "data/a.parquet")
+        self.assertEqual(sorted(chunk["formats"]), ["parquet-zstd6", "vortex"])
+        self.assertEqual(chunk["sinks"]["vortex"], "vortex/org__a/data/a.vortex")
+        self.assertEqual(source["already_present"], [])
+
+    def test_build_plan_skips_files_already_in_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp) / "sink" / "vortex" / "org__a" / "data" / "a.vortex"
+            existing.parent.mkdir(parents=True)
+            existing.write_bytes(b"x")
+            plan = self._plan(tmp)
+        chunk = plan["sources"][0]["chunks"][0]
+        self.assertEqual(chunk["formats"], ["parquet-zstd6"])
+        self.assertEqual(plan["sources"][0]["already_present"],
+                         ["vortex/org__a/data/a.vortex"])
+
+    def test_plan_round_trips_through_load_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self._plan(tmp)
+            path = Path(tmp) / "plan.json"
+            MODULE.atomic_json(path, plan)
+            loaded = MODULE.load_plan(path)
+            self.assertEqual(loaded, json.loads(json.dumps(plan)))
+
+    def test_load_plan_rejects_bad_plans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plan.json"
+            with self.assertRaisesRegex(RuntimeError, "plan not found"):
+                MODULE.load_plan(path)
+            path.write_text(json.dumps({"version": 99, "sources": []}))
+            with self.assertRaisesRegex(RuntimeError, "unsupported or invalid"):
+                MODULE.load_plan(path)
+            path.write_text(json.dumps({"version": 1, "sources": [],
+                                        "destination": {}, "formats": []}))
+            with self.assertRaisesRegex(RuntimeError, "no destination"):
+                MODULE.load_plan(path)
+            path.write_text(json.dumps({
+                "version": 1, "destination": {"local_dir": "/tmp/sink"},
+                "formats": ["vortex"], "created": "now",
+                "sources": [{"repo": "org/a", "revision": "abc",
+                             "chunks": [{"path": "a.parquet", "size": 1,
+                                         "formats": ["parquet-zstd6"], "sinks": {}}]}]}))
+            with self.assertRaisesRegex(RuntimeError, "outside the plan"):
+                MODULE.load_plan(path)
 
 
 class LocalCopyUploaderTest(unittest.TestCase):

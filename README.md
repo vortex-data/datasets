@@ -6,18 +6,39 @@ repositories as Vortex (and re-compressed Parquet) files.
 ## `scripts/hf-sync.py`
 
 Syncs a list of external Hugging Face dataset repositories into a vortex-data
-destination repository. For every selected source Parquet shard, the script maps
-it to a deterministic destination path that keeps the source file's name:
+destination repository, in **two explicit steps with an inspectable plan file
+in between**:
+
+```sh
+# Step 1: diff every source against the destination and write the work plan.
+HF_TOKEN=... scripts/hf-sync.py plan --sources sources.json \
+    --upload-repo vortex-data/mirror --plan plan.json
+
+# Inspect (or trim/edit) plan.json — it lists every file that will be synced,
+# the formats it is missing, and the exact destination paths.
+
+# Step 2: execute the plan — download, convert, upload.
+HF_TOKEN=... scripts/hf-sync.py run --plan plan.json \
+    --vx /path/to/vx --delete-after-upload
+```
+
+`plan` resolves each source to an immutable commit, maps every selected Parquet
+shard to a deterministic destination path that keeps the source file's name:
 
 ```
 <upload-prefix>/<format>/<source-repo-slug>/<source path>.{vortex,parquet}
 ```
 
-then diffs that path against the destination repository's file listing. Files
-already present in the destination are skipped; missing files are downloaded
-(Xet-accelerated), converted to each requested format, and uploaded in batched
+and diffs that path against the destination repository's listing. Pairs already
+present in the destination are recorded under `already_present`; the rest become
+work chunks — one per source file, listing the formats still missing and their
+destination paths. Nothing is transferred by `plan`.
+
+`run` executes only what the plan contains: each chunk is downloaded
+(Xet-accelerated), converted to its missing formats, and uploaded in batched
 Hub commits. Runs are checkpointed per source repository under `--output-dir`
-and are resumable after interruption.
+and are resumable after interruption; deleting entries from the plan before
+`run` skips them entirely.
 
 ### Sources
 
@@ -25,16 +46,8 @@ Sources come from a JSON file (see [`sources.example.json`](sources.example.json
 and/or a single `--repo`:
 
 ```sh
-# Diff every configured source against the destination without transferring:
-scripts/hf-sync.py --sources sources.json --upload-repo vortex-data/mirror --dry-run
-
-# Full sync of all configured sources:
-HF_TOKEN=... scripts/hf-sync.py --sources sources.json \
-    --upload-repo vortex-data/mirror --vx /path/to/vx --delete-after-upload
-
-# One-off single repository:
-scripts/hf-sync.py --repo HuggingFaceFW/fineweb --prefix data \
-    --filter 'sample/10BT/*' --upload-repo vortex-data/mirror --vx /path/to/vx
+scripts/hf-sync.py plan --repo HuggingFaceFW/fineweb --prefix data \
+    --filter 'sample/10BT/*' --upload-repo vortex-data/mirror
 ```
 
 Per-source keys: `repo` (required), `revision`, `prefix`, `include`, `filters`,
