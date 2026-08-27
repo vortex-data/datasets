@@ -499,6 +499,19 @@ def needs_source_download(file_state, outputs):
     return False
 
 
+def resumability_config(config):
+    """Reduce a run config to the fields that determine checkpoint compatibility.
+
+    A checkpoint stays valid across plan edits (trimmed or re-diffed chunks) and
+    operational tuning such as --delete-after-upload: checkpoint states are keyed
+    by source path and destination paths are deterministic. Only a different
+    pinned source revision or a different destination invalidates it.
+    """
+    source = config.get("plan_source", {})
+    return {"repo": source.get("repo"), "revision": source.get("revision"),
+            "destination": config.get("destination")}
+
+
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -771,10 +784,11 @@ def execute_source(api, plan, source, args, vx):
     checkpoint_path = output_dir / "checkpoint.json"
     checkpoint = load_checkpoint(checkpoint_path)
     previous_config = checkpoint.get("config")
-    if previous_config is not None and previous_config != run_config:
+    if (previous_config is not None
+            and resumability_config(previous_config) != resumability_config(run_config)):
         raise RuntimeError(
-            f"plan does not match {checkpoint_path}; re-run with the same plan "
-            "or use another --output-dir")
+            f"plan does not match {checkpoint_path}: the source revision or destination "
+            "changed; re-plan into the same destination or use another --output-dir")
     checkpoint["config"] = run_config
     checkpoint_lock = threading.Lock()
     atomic_json(checkpoint_path, checkpoint)

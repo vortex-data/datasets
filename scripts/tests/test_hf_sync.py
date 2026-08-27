@@ -222,6 +222,27 @@ class PlanTest(unittest.TestCase):
                 MODULE.load_plan(path)
 
 
+class ResumabilityTest(unittest.TestCase):
+    def test_resume_survives_plan_edits_and_tuning_changes(self):
+        old = {"plan_source": {"repo": "org/a", "revision": "abc",
+                               "chunks": [{"path": "a.parquet"}], "selected_files": 2},
+               "destination": {"repo": "vortex-data/mirror", "revision": "main", "prefix": ""},
+               "delete_after_upload": False}
+        trimmed = {**old, "delete_after_upload": True,
+                   "plan_source": {**old["plan_source"], "chunks": [], "selected_files": 1}}
+        self.assertEqual(MODULE.resumability_config(old), MODULE.resumability_config(trimmed))
+
+    def test_resume_rejects_revision_or_destination_changes(self):
+        base = {"plan_source": {"repo": "org/a", "revision": "abc"},
+                "destination": {"repo": "vortex-data/mirror"}}
+        moved_revision = {**base, "plan_source": {"repo": "org/a", "revision": "def"}}
+        moved_destination = {**base, "destination": {"repo": "vortex-data/other"}}
+        self.assertNotEqual(MODULE.resumability_config(base),
+                            MODULE.resumability_config(moved_revision))
+        self.assertNotEqual(MODULE.resumability_config(base),
+                            MODULE.resumability_config(moved_destination))
+
+
 class LocalCopyUploaderTest(unittest.TestCase):
     def test_round_trips_and_lists_existing_files(self):
         with tempfile.TemporaryDirectory() as scratch:
