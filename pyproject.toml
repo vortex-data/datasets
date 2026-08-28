@@ -3,3 +3,6 @@ required-version = ">=0.8.0"
 
 [tool.uv.workspace]
 members = ["scripts"]
+
+[tool.ruff]
+line-length = 120
