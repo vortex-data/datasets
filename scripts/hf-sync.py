@@ -2,56 +2,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-"""Sync Parquet shards from external Hugging Face repositories into a vortex-data repo.
+"""Convert physical Parquet shards in a Hugging Face dataset repository.
 
-The sync runs in two explicit steps with an inspectable plan file in between:
-
-  plan  Resolve each source repository to an immutable commit, list its Parquet
-        shards, diff every (shard, format) pair against the same-named path in
-        the destination repository, and write the resulting work chunks to a
-        JSON plan file. Nothing is downloaded or uploaded.
-
-  run   Execute a previously written plan: download each planned shard, convert
-        it to the formats the plan marked missing, and upload the outputs in
-        batched Hub commits. Runs are checkpointed per source and resumable.
-
-Edit or trim the plan file between the two steps to control exactly what runs.
+The source repository, revision, and folder are explicit. Source revisions are pinned to
+an immutable commit before bounded download, conversion, and per-format batch upload.
 """
 
 import abc
 import argparse
 import concurrent.futures
 import csv
-import datetime
 import fnmatch
 import hashlib
 import json
 import os
 import random
+import queue
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 
 DEFAULT_TARGET_BYTES = 10_000_000_000
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "hf-sync"
-DEFAULT_PLAN_PATH = DEFAULT_DATA_DIR / "plan.json"
 DEFAULT_XET_CACHE = DEFAULT_DATA_DIR / "xet-cache"
 DEFAULT_DOWNLOAD_BUFFER_BYTES = 64_000_000_000
 DEFAULT_UPLOAD_BUFFER_BYTES = 128_000_000_000
+DEFAULT_STATUS_INTERVAL = 5.0
 PARQUET_BATCH_ROWS = 65_536
-SUPPORTED_FORMATS = ("parquet-zstd6", "vortex", "vortex-compact")
-PLAN_VERSION = 1
 LOG_LOCK = threading.Lock()
-
-
-# --------------------------------------------------------------------------- logging
+OPERATIONAL_CONFIG_KEYS = {"xet_cache", "xet_high_performance", "xet_range_gets"}
+PLAN_VERSION = 2
+VX_CPU_SLOTS = None
 
 
 def safe_print(*values, file=None, **kwargs):
-    """Write progress without allowing a detached output pipe to stop a sync."""
+    """Write progress without allowing a detached output pipe to stop conversion."""
     target = file if file is not None else sys.stdout
     try:
         with LOG_LOCK:
@@ -66,27 +55,52 @@ def safe_print(*values, file=None, **kwargs):
             replacement.close()
 
 
-# ----------------------------------------------------------------------- Hub helpers
+def retryable_hub_error(error):
+    """Recognize transport failures, including transient errors wrapped by Xet."""
+    current = error
+    messages = []
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(str(current).lower())
+        try:
+            import httpx
+            if isinstance(current, httpx.TransportError):
+                return True
+        except ImportError:
+            pass
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+        response = getattr(current, "response", None)
+        status = getattr(response, "status_code", None)
+        if status in (408, 425, 429) or (status is not None and status >= 500):
+            return True
+        current = current.__cause__ or current.__context__
+    message = " ".join(messages)
+    return any(fragment in message for fragment in (
+        "timed out", "timeout", "request body", "connection reset",
+        "connection aborted", "connection closed", "broken pipe",
+        "temporarily unavailable", "internal error",
+    ))
 
 
-def retry_call(operation, attempts, base_delay=1.0):
-    """Retry a Hub operation with bounded exponential backoff."""
+def retry_call(operation, attempts, base_delay=1.0, max_delay=60.0):
+    """Retry transient Hub/Xet operations with bounded jittered exponential backoff."""
     for attempt in range(1, attempts + 1):
         try:
             return operation()
         except Exception as error:
-            try:
-                import httpx
-                transport_error = isinstance(error, httpx.TransportError)
-            except ImportError:
-                transport_error = False
-            response = getattr(error, "response", None)
-            status = getattr(response, "status_code", None)
-            retryable = (isinstance(error, (ConnectionError, TimeoutError)) or transport_error
-                         or status in (408, 429) or (status is not None and status >= 500))
-            if attempt == attempts or not retryable:
+            if attempt == attempts or not retryable_hub_error(error):
                 raise
-            time.sleep(base_delay * 2 ** (attempt - 1))
+            delay = min(max_delay, base_delay * 2 ** (attempt - 1))
+            delay += random.uniform(0, delay * 0.25)
+            safe_print(
+                f"transient Hub error (attempt {attempt}/{attempts}): {error}; "
+                f"retrying in {delay:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 def parse_size(value):
@@ -146,6 +160,32 @@ def list_shards(api, repo, revision, prefix, include, filters=(), attempts=3):
     return sorted(shards, key=lambda shard: shard["path"])
 
 
+def select_evenly(shards, target_bytes, seed):
+    """Select seeded positions spread evenly over the complete ordered shard list."""
+    average = sum(shard["size"] for shard in shards) / len(shards)
+    count = min(len(shards), max(1, round(target_bytes / average)))
+    rng = random.Random(seed)
+    while True:
+        selected = []
+        for index in range(count):
+            start = index * len(shards) // count
+            stop = (index + 1) * len(shards) // count
+            selected.append(shards[rng.randrange(start, stop)])
+        total = sum(shard["size"] for shard in selected)
+        if total >= target_bytes or count == len(shards):
+            return selected
+        count += 1
+        rng = random.Random(seed)
+
+
+def destination_path(source_path, fmt, upload_prefix=""):
+    """Map a source Parquet path to its deterministic encoded repository path."""
+    suffix = ".parquet" if fmt == "parquet-zstd6" else ".vortex"
+    encoded = str(Path(source_path).with_suffix(suffix))
+    parts = [upload_prefix.strip("/"), fmt, encoded]
+    return "/".join(part.strip("/") for part in parts if part.strip("/"))
+
+
 def list_repository_files(api, repo, revision, prefix="", attempts=3):
     """Return dataset repository file metadata keyed by path."""
     from huggingface_hub.errors import RemoteEntryNotFoundError
@@ -182,9 +222,6 @@ def download_shard(repo, revision, shard, download_root, attempts, etag_timeout)
     return path, elapsed
 
 
-# ------------------------------------------------------------------------ conversion
-
-
 def parquet_zstd6(source, destination):
     try:
         import pyarrow.parquet as pq
@@ -205,7 +242,11 @@ def parquet_zstd6(source, destination):
     return time.monotonic() - started
 
 
-def run_vx(vx, source, destination, strategy):
+def run_vx(vx, source, destination, strategy, cpu=None):
+    leased_cpu = False
+    if cpu is None and VX_CPU_SLOTS is not None:
+        cpu = VX_CPU_SLOTS.get()
+        leased_cpu = True
     staging = source.parent / f".{destination.stem}.{strategy}.input.parquet"
     generated = staging.with_suffix(".vortex")
     staging.unlink(missing_ok=True)
@@ -213,7 +254,12 @@ def run_vx(vx, source, destination, strategy):
     os.link(source, staging)
     started = time.monotonic()
     try:
-        subprocess.run([str(vx), "convert", str(staging), "--strategy", strategy, "--quiet"], check=True)
+        command = [str(vx), "convert", str(staging), "--strategy", strategy, "--quiet"]
+        if cpu is not None:
+            command = ["taskset", "--cpu-list", str(cpu), *command]
+        environment = os.environ.copy()
+        environment["TOKIO_WORKER_THREADS"] = "1"
+        subprocess.run(command, check=True, env=environment)
         elapsed = time.monotonic() - started
         destination.parent.mkdir(parents=True, exist_ok=True)
         generated.replace(destination)
@@ -221,17 +267,8 @@ def run_vx(vx, source, destination, strategy):
     finally:
         staging.unlink(missing_ok=True)
         generated.unlink(missing_ok=True)
-
-
-def file_sha256(path, chunk_size=8 * 1024 * 1024):
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(chunk_size), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-# ------------------------------------------------------------------------- uploaders
+        if leased_cpu:
+            VX_CPU_SLOTS.put(cpu)
 
 
 class Uploader(abc.ABC):
@@ -254,7 +291,7 @@ class HuggingFaceBatchUploader(Uploader):
     """Preupload outputs and commit up to a fixed file count per format."""
 
     def __init__(self, api, repo, revision, batch_files, totals, attempts=5, timeout=30,
-                 batch_bytes=None):
+                 batch_bytes=None, planned_batches=None):
         self.api = api
         self.repo = repo
         self.revision = revision
@@ -263,8 +300,17 @@ class HuggingFaceBatchUploader(Uploader):
         self.attempts = attempts
         self.timeout = timeout
         self.batch_bytes = batch_bytes
+        self.planned_batches = {
+            batch["id"]: batch for batch in (planned_batches or [])
+        }
+        self.batch_for_path = {
+            path: batch["id"]
+            for batch in self.planned_batches.values()
+            for path in batch["destination_paths"]
+        }
         self.parent_commit = resolve_dataset_revision(api, repo, revision, attempts, timeout)
-        self.pending = {fmt: [] for fmt in totals}
+        self.pending = ({batch_id: [] for batch_id in self.planned_batches}
+                        if self.planned_batches else {fmt: [] for fmt in totals})
         self.lock = threading.Lock()
 
     def upload(self, local_path, destination_path, *, format_name, ordinal, **metadata):
@@ -279,8 +325,17 @@ class HuggingFaceBatchUploader(Uploader):
                  "hub_path": destination_path, "size_bytes": local_path.stat().st_size,
                  "format": format_name, "ordinal": ordinal}
         with self.lock:
-            pending = self.pending[format_name]
+            pending_key = self.batch_for_path.get(destination_path, format_name)
+            if self.planned_batches and pending_key == format_name:
+                raise RuntimeError(f"destination is not present in the action plan: {destination_path}")
+            pending = self.pending[pending_key]
             pending.append(entry)
+            if self.planned_batches:
+                expected = len(self.planned_batches[pending_key]["destination_paths"])
+                if len(pending) == expected:
+                    return self._flush_format_locked(pending_key)
+                return {"status": "preuploaded", "hub_path": destination_path,
+                        "seconds": time.monotonic() - started}
             pending_bytes = sum(item["size_bytes"] for item in pending)
             if (len(pending) >= self.batch_files
                     or (self.batch_bytes is not None and pending_bytes >= self.batch_bytes)):
@@ -297,17 +352,20 @@ class HuggingFaceBatchUploader(Uploader):
                     results.append(result)
             return results
 
-    def _flush_format_locked(self, format_name):
+    def _flush_format_locked(self, pending_key):
         from huggingface_hub import CommitOperationAdd
 
-        batch = self.pending[format_name]
+        batch = self.pending[pending_key]
         if not batch:
             return {"status": "empty", "committed": []}
         batch.sort(key=lambda entry: entry["ordinal"])
-        start = batch[0]["ordinal"]
-        end = batch[-1]["ordinal"]
-        total_files = self.totals[format_name]
-        message = f"Upload {format_name} files {start}-{end} of {total_files}"
+        planned = self.planned_batches.get(pending_key)
+        format_name = planned["format"] if planned else pending_key
+        start = planned["start"] if planned else batch[0]["ordinal"]
+        end = planned["end"] if planned else batch[-1]["ordinal"]
+        total_files = planned["total_files"] if planned else self.totals[format_name]
+        message = (planned["commit_message"] if planned else
+                   f"Upload {format_name} files {start}-{end} of {total_files}")
         operations = [entry["operation"] for entry in batch]
         result = None
         for attempt in range(1, self.attempts + 1):
@@ -347,7 +405,7 @@ class HuggingFaceBatchUploader(Uploader):
                       for key in ("local_path", "hub_path", "size_bytes", "format", "ordinal")}
                      for entry in batch]
         total_bytes = sum(entry["size_bytes"] for entry in batch)
-        self.pending[format_name] = []
+        self.pending[pending_key] = []
         self.parent_commit = result.oid
         return {"status": "complete", "url": result.commit_url,
                 "commit_id": result.oid, "committed": committed, "size_bytes": total_bytes,
@@ -414,74 +472,28 @@ def upload_then_maybe_delete(uploader, local_path, destination_path, delete_afte
     return result
 
 
-# -------------------------------------------------------------- selection and diffing
-
-
-def select_evenly(shards, target_bytes, seed):
-    """Select seeded positions spread evenly over the complete ordered shard list."""
-    average = sum(shard["size"] for shard in shards) / len(shards)
-    count = min(len(shards), max(1, round(target_bytes / average)))
-    rng = random.Random(seed)
-    while True:
-        selected = []
-        for index in range(count):
-            start = index * len(shards) // count
-            stop = (index + 1) * len(shards) // count
-            selected.append(shards[rng.randrange(start, stop)])
-        total = sum(shard["size"] for shard in selected)
-        if total >= target_bytes or count == len(shards):
-            return selected
-        count += 1
-        rng = random.Random(seed)
-
-
-def repo_slug(repo):
-    """Stable filesystem/Hub-safe identifier for one source repository."""
-    return repo.strip("/").replace("/", "__")
-
-
-def destination_path(source_repo, source_path, fmt, upload_prefix=""):
-    """Map a source Parquet path to its deterministic encoded destination path.
-
-    The destination keeps the source file's own name so a later run can diff by
-    name: <upload_prefix>/<format>/<source-repo-slug>/<source path with new suffix>.
-    """
-    suffix = ".parquet" if fmt == "parquet-zstd6" else ".vortex"
-    encoded = str(Path(source_path).with_suffix(suffix))
-    parts = [upload_prefix.strip("/"), fmt, repo_slug(source_repo), encoded]
-    return "/".join(part.strip("/") for part in parts if part.strip("/"))
-
-
-def diff_selection(source_repo, selection, formats, existing_sink_files, upload_prefix=""):
-    """Split each (shard, format) pair into missing versus already-present.
-
-    A destination file with the same mapped name counts as present regardless of
-    size: conversion changes bytes, so name identity is the sync key.
-    """
-    missing, present = [], []
-    for shard in selection:
-        for fmt in formats:
-            sink_path = destination_path(source_repo, shard["path"], fmt, upload_prefix)
-            entry = {"shard": shard, "format": fmt, "sink_path": sink_path,
-                     "remote": existing_sink_files.get(sink_path)}
-            (present if entry["remote"] is not None else missing).append(entry)
-    return missing, present
-
-
-def select_shards(source, shards):
-    if source["mode"] == "all":
-        return shards
-    if source["mode"] == "first":
-        return shards[:source["limit"]]
-    return select_evenly(shards, source["target_size"], source["seed"])
-
-
-# ------------------------------------------------------------- checkpoints and reports
+def file_sha256(path, chunk_size=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(chunk_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def fits_download_buffer(inflight_bytes, next_bytes, limit_bytes):
     """Allow one oversized shard, but never grow an occupied buffer past its limit."""
     return inflight_bytes == 0 or inflight_bytes + next_bytes <= limit_bytes
+
+
+def completed_futures(futures):
+    """Yield (key, future) in completion order, removing each from the input mapping."""
+    while futures:
+        done, _ = concurrent.futures.wait(futures.values(),
+                                          return_when=concurrent.futures.FIRST_COMPLETED)
+        for completed in done:
+            key = next(key for key, future in futures.items() if future is completed)
+            futures.pop(key)
+            yield key, completed
 
 
 def needs_source_download(file_state, outputs):
@@ -500,16 +512,8 @@ def needs_source_download(file_state, outputs):
 
 
 def resumability_config(config):
-    """Reduce a run config to the fields that determine checkpoint compatibility.
-
-    A checkpoint stays valid across plan edits (trimmed or re-diffed chunks) and
-    operational tuning such as --delete-after-upload: checkpoint states are keyed
-    by source path and destination paths are deterministic. Only a different
-    pinned source revision or a different destination invalidates it.
-    """
-    source = config.get("plan_source", {})
-    return {"repo": source.get("repo"), "revision": source.get("revision"),
-            "destination": config.get("destination")}
+    """Remove transfer-tuning fields that do not affect selected files or encoded bytes."""
+    return {key: value for key, value in config.items() if key not in OPERATIONAL_CONFIG_KEYS}
 
 
 def atomic_json(path, value):
@@ -517,6 +521,36 @@ def atomic_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+class LiveStatus:
+    """Periodically publish an atomic, machine-readable scheduler snapshot."""
+
+    def __init__(self, path, interval, snapshot):
+        self.path = path
+        self.interval = interval
+        self.snapshot = snapshot
+        self.started = time.monotonic()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="status-writer", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def write(self, final=False):
+        value = self.snapshot()
+        value.update(schema_version=1, elapsed_seconds=time.monotonic() - self.started,
+                     updated_at_unix=time.time(), final=final)
+        atomic_json(self.path, value)
+
+    def _run(self):
+        while not self.stop_event.wait(self.interval):
+            self.write()
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join()
+        self.write(final=True)
 
 
 def load_checkpoint(path):
@@ -534,7 +568,7 @@ def checkpoint_records(checkpoint):
     for source_name in sorted(checkpoint["files"]):
         outputs = checkpoint["files"][source_name].get("outputs", {})
         for fmt in sorted(outputs):
-            if outputs[fmt].get("status") == "complete" and outputs[fmt].get("metrics"):
+            if outputs[fmt].get("status") == "complete":
                 source_size = checkpoint["files"][source_name]["size"]
                 metrics = outputs[fmt]["metrics"]
                 records.append({"source": source_name, "format": fmt,
@@ -547,7 +581,7 @@ def checkpoint_records(checkpoint):
     return records
 
 
-def write_reports(checkpoint, output_dir, chunks):
+def write_reports(checkpoint, output_dir, selection):
     records = checkpoint_records(checkpoint)
     metrics_dir = output_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -572,8 +606,8 @@ def write_reports(checkpoint, output_dir, chunks):
               "bytes_saved_vs_parquet": source_totals[fmt] - size}
         for fmt, size in totals.items()
     }
-    summary = {"planned_source_bytes": sum(chunk["size"] for chunk in chunks),
-               "planned_files": len(chunks), "format_size_bytes": totals,
+    summary = {"selected_source_bytes": sum(item["size"] for item in selection),
+               "selected_files": len(selection), "format_size_bytes": totals,
                "format_comparison": comparisons}
     atomic_json(metrics_dir / "summary.json", summary)
     safe_print(json.dumps(summary, indent=2, sort_keys=True))
@@ -587,256 +621,503 @@ def metric(source_name, fmt, path, input_size, seconds):
             "sha256": file_sha256(path)}
 
 
-# ----------------------------------------------------------------- source definitions
+def add_selection_arguments(parser):
+    parser.add_argument("--mode", choices=("sample", "first", "all"), default="sample",
+                        help="sample evenly, take the first --limit shards, or stream every shard")
+    parser.add_argument("--limit", type=int, default=10,
+                        help="number of ordered shards selected by --mode first")
+    parser.add_argument("--target-size", type=parse_size, default=DEFAULT_TARGET_BYTES)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--repo", required=True, help="source Hugging Face dataset repository")
+    parser.add_argument("--revision", required=True,
+                        help="source branch, tag, or commit (resolved before planning)")
+    parser.add_argument("--prefix", required=True,
+                        help="source repository folder; use / to scan the repository root")
+    parser.add_argument("--include", default="*.parquet",
+                        help="glob matched against paths below --prefix (default: *.parquet)")
+    parser.add_argument("--filter", action="append", default=[],
+                        help="repeatable full repository-path glob, e.g. 'sample/10BT/*'")
+    parser.add_argument("--formats", default="parquet-zstd6,vortex,vortex-compact",
+                        help="comma-separated outputs: parquet-zstd6,vortex,vortex-compact")
+    parser.add_argument("--upload-repo", required=True,
+                        help="destination Hugging Face dataset repository")
+    parser.add_argument("--upload-revision", default="main")
+    parser.add_argument("--upload-prefix", default="")
+    parser.add_argument("--upload-batch-files", type=int, default=100,
+                        help="maximum actions in each planned Hugging Face commit")
+    parser.add_argument("--upload-batch-size", type=parse_size, default=100_000_000_000,
+                        help="maximum planned source bytes represented by one target commit")
+    parser.add_argument("--hub-attempts", type=int, default=8)
+    parser.add_argument("--hub-timeout", type=int, default=30)
 
 
-SOURCE_DEFAULTS = {"revision": "main", "prefix": "", "include": "*.parquet",
-                   "filters": [], "mode": "all", "limit": 10,
-                   "target_size": DEFAULT_TARGET_BYTES, "seed": 0}
+def add_operational_arguments(parser):
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--vx", type=Path, default=Path("target/release/vx"))
+    parser.add_argument("--format-workers", type=int, default=3)
+    parser.add_argument("--transcode-workers", type=int, default=max(1, os.cpu_count() or 1),
+                        help="maximum single-core transcodes active across downloaded shards")
+    parser.add_argument("--shard-workers", type=int, default=2,
+                        help="initial downloads (deprecated alias)")
+    parser.add_argument("--download-initial-concurrency", type=int)
+    parser.add_argument("--download-max-concurrency", type=int, default=8)
+    parser.add_argument("--download-buffer-files", type=int, default=100)
+    parser.add_argument("--download-buffer-size", type=parse_size,
+                        default=DEFAULT_DOWNLOAD_BUFFER_BYTES)
+    parser.add_argument("--upload-workers", type=int, default=2)
+    parser.add_argument("--upload-max-concurrency", type=int, default=8)
+    parser.add_argument("--upload-local-dir", type=Path,
+                        help="copy outputs to a local sink instead of Hugging Face")
+    parser.add_argument("--upload-buffer-files", type=int, default=100)
+    parser.add_argument("--upload-batch-files", type=int, default=100)
+    parser.add_argument("--upload-buffer-size", type=parse_size,
+                        default=DEFAULT_UPLOAD_BUFFER_BYTES)
+    parser.add_argument("--hub-attempts", type=int, default=8)
+    parser.add_argument("--hub-timeout", type=int, default=30)
+    parser.add_argument("--xet-range-gets", type=int, default=4)
+    parser.add_argument("--xet-cache", type=Path, default=DEFAULT_XET_CACHE)
+    parser.add_argument("--xet-high-performance", action="store_true")
+    parser.add_argument("--keep-downloads", action="store_true")
+    parser.add_argument("--delete-after-upload", action="store_true")
+    parser.add_argument("--status-interval", type=float, default=DEFAULT_STATUS_INTERVAL)
+    parser.add_argument("--detached", action="store_true")
 
 
-def load_sources(args):
-    """Build the list of source repositories from --sources and/or --repo."""
-    sources = []
-    if args.sources:
-        with args.sources.open() as handle:
-            listed = json.load(handle)
-        if not isinstance(listed, list) or not listed:
-            raise RuntimeError(f"{args.sources} must contain a non-empty JSON list of sources")
-        for index, entry in enumerate(listed):
-            if not isinstance(entry, dict) or "repo" not in entry:
-                raise RuntimeError(f"source #{index + 1} in {args.sources} needs a 'repo' key")
-            unknown = set(entry) - set(SOURCE_DEFAULTS) - {"repo"}
-            if unknown:
-                raise RuntimeError(f"source {entry['repo']}: unknown keys {sorted(unknown)}")
-            source = {**SOURCE_DEFAULTS, **entry}
-            if isinstance(source["target_size"], str):
-                source["target_size"] = parse_size(source["target_size"])
-            sources.append(source)
-    if args.repo:
-        sources.append({**SOURCE_DEFAULTS, "repo": args.repo, "revision": args.revision,
-                        "prefix": args.prefix or "", "include": args.include,
-                        "filters": args.filter, "mode": args.mode, "limit": args.limit,
-                        "target_size": args.target_size, "seed": args.seed})
-    if not sources:
-        raise RuntimeError("no sources: pass --sources <file> and/or --repo <repo>")
-    seen = set()
-    for source in sources:
-        source["prefix"] = source["prefix"].strip("/")
-        if source["mode"] not in ("sample", "first", "all"):
-            raise RuntimeError(f"source {source['repo']}: mode must be sample, first, or all")
-        if source["limit"] < 1:
-            raise RuntimeError(f"source {source['repo']}: limit must be positive")
-        if source["repo"] in seen:
-            raise RuntimeError(f"duplicate source repository: {source['repo']}")
-        seen.add(source["repo"])
-    return sources
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    plan = commands.add_parser("plan", help="discover differences and write an action plan")
+    add_selection_arguments(plan)
+    plan.add_argument("--plan-file", type=Path, required=True)
+    apply = commands.add_parser("apply", help="execute a previously reviewed action plan")
+    apply.add_argument("plan_file", type=Path)
+    add_operational_arguments(apply)
+    return parser.parse_args()
 
 
-# ----------------------------------------------------------------------- step 1: plan
+def parse_formats(value):
+    formats = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    supported = {"parquet-zstd6", "vortex", "vortex-compact"}
+    if not formats or not set(formats) <= supported:
+        raise RuntimeError("--formats must contain parquet-zstd6, vortex, and/or vortex-compact")
+    return formats
 
 
-def list_destination_files(api, destination, source_repo, formats, attempts):
-    """List destination files under this source's per-format prefixes."""
-    prefixes = ["/".join(part for part in (destination["prefix"].strip("/"), fmt,
-                                           repo_slug(source_repo)) if part)
-                for fmt in formats]
+def select_shards(shards, mode, limit, target_bytes, seed):
+    if limit < 1:
+        raise RuntimeError("--limit must be positive")
+    if mode == "all":
+        return shards
+    if mode == "first":
+        return shards[:limit]
+    return select_evenly(shards, target_bytes, seed)
+
+
+def plan_remote_metadata(remote):
+    lfs = remote.get("lfs") or {}
+    if not isinstance(lfs, dict):
+        lfs = getattr(lfs, "__dict__", {})
+    return {"size": remote.get("size"), "oid": remote.get("oid"),
+            "sha256": lfs.get("sha256")}
+
+
+def create_action_plan(api, args):
+    formats = parse_formats(args.formats)
+    if args.upload_batch_files < 1 or args.upload_batch_files > 100:
+        raise RuntimeError("--upload-batch-files must be between 1 and 100")
+    upload_batch_size = getattr(args, "upload_batch_size", 100_000_000_000)
+    if upload_batch_size < 1:
+        raise RuntimeError("--upload-batch-size must be positive")
+    prefix = args.prefix.strip("/")
+    require_xet_repository(api, args.repo, args.revision, args.hub_attempts)
+    require_xet_repository(api, args.upload_repo, args.upload_revision, args.hub_attempts)
+    source_commit = resolve_dataset_revision(
+        api, args.repo, args.revision, args.hub_attempts, args.hub_timeout)
+    destination_commit = resolve_dataset_revision(
+        api, args.upload_repo, args.upload_revision, args.hub_attempts, args.hub_timeout)
+    shards = list_shards(api, args.repo, source_commit, prefix, args.include,
+                         args.filter, args.hub_attempts)
+    selection = select_shards(shards, args.mode, args.limit, args.target_size, args.seed)
     existing = {}
-    if destination.get("repo"):
-        for prefix in prefixes:
-            existing.update(list_repository_files(
-                api, destination["repo"], destination["revision"], prefix, attempts))
-    elif destination.get("local_dir"):
-        probe = LocalCopyUploader(Path(destination["local_dir"]))
-        for prefix in prefixes:
-            existing.update(probe.existing_files(prefix))
-    return existing
-
-
-def build_plan(api, sources, destination, formats, attempts, timeout):
-    """Resolve, list, and diff every source; return the executable plan."""
-    plan_sources = []
-    for source in sources:
-        source_commit = resolve_dataset_revision(
-            api, source["repo"], source["revision"], attempts, timeout)
-        shards = list_shards(api, source["repo"], source_commit, source["prefix"],
-                             source["include"], source["filters"], attempts)
-        selection = select_shards(source, shards)
-        existing = list_destination_files(api, destination, source["repo"], formats, attempts)
-        missing, present = diff_selection(source["repo"], selection, formats,
-                                          existing, destination["prefix"])
-        chunks = {}
-        for entry in missing:
-            shard = entry["shard"]
-            chunk = chunks.setdefault(shard["path"], {
-                "path": shard["path"], "size": shard["size"], "sha256": shard.get("sha256"),
-                "formats": [], "sinks": {}})
-            chunk["formats"].append(entry["format"])
-            chunk["sinks"][entry["format"]] = entry["sink_path"]
-        plan_sources.append({
-            "repo": source["repo"], "requested_revision": source["revision"],
-            "revision": source_commit, "prefix": source["prefix"],
-            "include": source["include"], "filters": source["filters"],
-            "mode": source["mode"], "limit": source["limit"],
-            "target_bytes": source["target_size"], "seed": source["seed"],
-            "selected_files": len(selection),
-            "selected_bytes": sum(shard["size"] for shard in selection),
-            "already_present": sorted(entry["sink_path"] for entry in present),
-            "chunks": [chunks[path] for path in sorted(chunks)],
-        })
+    for fmt in formats:
+        format_prefix = "/".join(
+            part for part in (args.upload_prefix.strip("/"), fmt) if part)
+        existing.update(list_repository_files(
+            api, args.upload_repo, destination_commit, format_prefix, args.hub_attempts))
+    chunks = []
+    counts = {"create": 0, "skip": 0}
+    for ordinal, shard in enumerate(selection, 1):
+        actions = []
+        for fmt in formats:
+            sink_path = destination_path(shard["path"], fmt, args.upload_prefix)
+            remote = existing.get(sink_path)
+            action = {"action": "skip" if remote else "create", "format": fmt,
+                      "destination_path": sink_path}
+            if remote:
+                action["existing"] = plan_remote_metadata(remote)
+            counts[action["action"]] += 1
+            actions.append(action)
+        chunks.append({"ordinal": ordinal, "source": shard, "actions": actions})
+    upload_batches = []
+    for fmt in formats:
+        format_actions = [
+            (chunk, action)
+            for chunk in chunks for action in chunk["actions"]
+            if action["format"] == fmt and action["action"] == "create"
+        ]
+        total = len(format_actions)
+        groups = []
+        group = []
+        group_bytes = 0
+        for member in format_actions:
+            source_bytes = member[0]["source"]["size"]
+            if group and (len(group) >= args.upload_batch_files
+                          or group_bytes + source_bytes > upload_batch_size):
+                groups.append(group)
+                group = []
+                group_bytes = 0
+            group.append(member)
+            group_bytes += source_bytes
+        if group:
+            groups.append(group)
+        offset = 0
+        for members in groups:
+            start = offset + 1
+            end = offset + len(members)
+            batch_id = f"{fmt}-{start}-{end}"
+            message = f"Upload {fmt} files {start}-{end} of {total}"
+            for _, action in members:
+                action["upload_batch"] = batch_id
+                action["commit_message"] = message
+            upload_batches.append({
+                "id": batch_id,
+                "format": fmt,
+                "start": start,
+                "end": end,
+                "total_files": total,
+                "commit_message": message,
+                "source_ordinals": [chunk["ordinal"] for chunk, _ in members],
+                "destination_paths": [action["destination_path"] for _, action in members],
+                "planned_source_bytes": sum(chunk["source"]["size"] for chunk, _ in members),
+            })
+            offset = end
     return {
         "version": PLAN_VERSION,
-        "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "destination": destination,
+        "kind": "hf-sync-plan",
+        "created_at_unix_seconds": time.time(),
+        "source": {"repo": args.repo, "requested_revision": args.revision,
+                   "revision": source_commit, "prefix": prefix, "include": args.include,
+                   "filters": args.filter},
+        "destination": {"repo": args.upload_repo,
+                        "requested_revision": args.upload_revision,
+                        "revision": destination_commit,
+                        "prefix": args.upload_prefix.strip("/")},
+        "selection": {"mode": args.mode, "limit": args.limit,
+                      "target_bytes": args.target_size, "seed": args.seed},
         "formats": list(formats),
-        "sources": plan_sources,
+        "work_chunks": chunks,
+        "upload_batches": upload_batches,
+        "summary": {"source_files": len(selection),
+                    "source_bytes": sum(shard["size"] for shard in selection),
+                    "create_actions": counts["create"], "skip_actions": counts["skip"]},
     }
 
 
-def summarize_plan(plan):
-    for source in plan["sources"]:
-        pending_bytes = sum(chunk["size"] for chunk in source["chunks"])
-        safe_print(
-            f"{source['repo']}@{source['requested_revision']} ({source['revision'][:12]}): "
-            f"{source['selected_files']} shards selected, "
-            f"{len(source['already_present'])} outputs already in destination, "
-            f"{len(source['chunks'])} files to sync ({pending_bytes / 1e9:.2f} GB source)",
-            flush=True,
-        )
-
-
-def load_plan(path):
-    if not path.exists():
-        raise RuntimeError(f"plan not found: {path}; create one with the 'plan' command")
-    with path.open() as handle:
-        plan = json.load(handle)
-    if plan.get("version") != PLAN_VERSION or not isinstance(plan.get("sources"), list):
-        raise RuntimeError(f"unsupported or invalid plan: {path}")
-    destination = plan.get("destination") or {}
-    if not destination.get("repo") and not destination.get("local_dir"):
-        raise RuntimeError(f"plan {path} has no destination repo or local_dir")
-    formats = plan.get("formats") or []
-    if not set(formats) <= set(SUPPORTED_FORMATS):
-        raise RuntimeError(f"plan {path} contains unsupported formats: {formats}")
-    for source in plan["sources"]:
-        for key in ("repo", "revision", "chunks"):
-            if key not in source:
-                raise RuntimeError(f"plan {path}: source entry missing '{key}'")
-        for chunk in source["chunks"]:
-            for key in ("path", "size", "formats", "sinks"):
-                if key not in chunk:
-                    raise RuntimeError(
-                        f"plan {path}: chunk for {source['repo']} missing '{key}'")
-            if not set(chunk["formats"]) <= set(formats):
-                raise RuntimeError(
-                    f"plan {path}: chunk {chunk['path']} lists formats outside the plan's")
+def load_action_plan(path):
+    with path.open() as source:
+        plan = json.load(source)
+    if (plan.get("version") != PLAN_VERSION
+            or plan.get("kind") != "hf-sync-plan"
+            or not isinstance(plan.get("work_chunks"), list)):
+        raise RuntimeError(f"unsupported or invalid action plan: {path}")
+    batches = plan.get("upload_batches")
+    if not isinstance(batches, list):
+        raise RuntimeError(f"unsupported or invalid action plan: {path}")
+    batch_paths = {}
+    for batch in batches:
+        batch_id = batch.get("id")
+        if not batch_id or batch_id in batch_paths or not batch.get("commit_message"):
+            raise RuntimeError(f"unsupported or invalid upload batch in {path}")
+        for destination in batch.get("destination_paths", []):
+            if destination in batch_paths:
+                raise RuntimeError(f"destination appears in multiple upload batches: {destination}")
+            batch_paths[destination] = batch_id
+    create_paths = set()
+    for chunk in plan["work_chunks"]:
+        if not isinstance(chunk.get("source"), dict) or not isinstance(chunk.get("actions"), list):
+            raise RuntimeError(f"unsupported or invalid action plan: {path}")
+        for action in chunk["actions"]:
+            if action.get("action") not in ("create", "skip"):
+                raise RuntimeError(f"unsupported action in {path}: {action.get('action')}")
+            if action["action"] == "create":
+                destination = action.get("destination_path")
+                create_paths.add(destination)
+                if action.get("upload_batch") != batch_paths.get(destination):
+                    raise RuntimeError(f"create action has no matching upload batch: {destination}")
+    if create_paths != set(batch_paths):
+        raise RuntimeError(f"upload batches do not match create actions in {path}")
     return plan
 
 
-def plan_command(args):
-    formats = parse_formats(args.formats)
-    sources = load_sources(args)
-    destination = {"repo": args.upload_repo,
-                   "local_dir": str(args.upload_local_dir) if args.upload_local_dir else None,
-                   "revision": args.upload_revision, "prefix": args.upload_prefix}
-    api = hub_api()
-    for source in sources:
-        require_xet_repository(api, source["repo"], source["revision"], args.hub_attempts)
-    if args.upload_repo:
-        require_xet_repository(api, args.upload_repo, args.upload_revision, args.hub_attempts)
-    plan = build_plan(api, sources, destination, formats, args.hub_attempts, args.hub_timeout)
-    atomic_json(args.plan, plan)
-    summarize_plan(plan)
-    total = sum(len(source["chunks"]) for source in plan["sources"])
-    safe_print(f"plan written to {args.plan}: {total} files to sync; "
-               "inspect or edit it, then execute with the 'run' command", flush=True)
-    return 0
-
-
-# ------------------------------------------------------------------------ step 2: run
-
-
-def execute_source(api, plan, source, args, vx):
-    """Execute one source's planned chunks: download, convert, upload."""
-    source_repo = source["repo"]
-    source_commit = source["revision"]
+def apply_plan_arguments(args, plan):
+    source = plan["source"]
     destination = plan["destination"]
-    chunks = source["chunks"]
-    output_dir = args.output_dir / repo_slug(source_repo)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if not chunks:
-        safe_print(f"{source_repo}: nothing planned; skipping", flush=True)
-        return
-    totals = {}
-    for chunk in chunks:
-        for fmt in chunk["formats"]:
-            totals[fmt] = totals.get(fmt, 0) + 1
-    if destination.get("repo"):
-        uploader = HuggingFaceBatchUploader(
-            api, destination["repo"], destination["revision"], args.upload_batch_files,
-            totals, args.hub_attempts, args.hub_timeout,
-            batch_bytes=max(1, args.upload_buffer_size // len(totals)))
-    else:
-        uploader = LocalCopyUploader(Path(destination["local_dir"]))
-    run_config = {"plan_source": {key: source[key] for key in source if key != "already_present"},
-                  "destination": destination,
-                  "delete_after_upload": args.delete_after_upload}
-    checkpoint_path = output_dir / "checkpoint.json"
+    selection = plan["selection"]
+    args.repo = source["repo"]
+    args.revision = source["revision"]
+    args.prefix = source["prefix"]
+    args.include = source["include"]
+    args.filter = source["filters"]
+    args.upload_repo = destination["repo"]
+    args.upload_revision = destination["requested_revision"]
+    args.upload_prefix = destination["prefix"]
+    args.formats = ",".join(plan["formats"])
+    args.mode = selection["mode"]
+    args.limit = selection["limit"]
+    args.target_size = selection["target_bytes"]
+    args.seed = selection["seed"]
+    return [chunk["source"] for chunk in plan["work_chunks"]]
+
+
+def main():
+    global VX_CPU_SLOTS
+    args = parse_args()
+    if args.command == "plan":
+        plan = create_action_plan(hub_api(), args)
+        atomic_json(args.plan_file, plan)
+        safe_print(json.dumps(plan["summary"], indent=2, sort_keys=True))
+        safe_print(f"Plan written to {args.plan_file}")
+        return 0
+    plan = load_action_plan(args.plan_file)
+    selection = apply_plan_arguments(args, plan)
+    if args.format_workers < 1 or args.format_workers > 3:
+        raise RuntimeError("--format-workers must be between 1 and 3")
+    if args.transcode_workers < 1:
+        raise RuntimeError("--transcode-workers must be positive")
+    if args.shard_workers < 1:
+        raise RuntimeError("--shard-workers must be positive")
+    if args.download_initial_concurrency is None:
+        args.download_initial_concurrency = args.shard_workers
+    if not 1 <= args.download_initial_concurrency <= args.download_max_concurrency:
+        raise RuntimeError("download concurrency must satisfy 1 <= initial <= max")
+    if args.download_buffer_size < 1:
+        raise RuntimeError("--download-buffer-size must be positive")
+    if args.download_buffer_files < 1:
+        raise RuntimeError("--download-buffer-files must be positive")
+    if args.upload_workers < 1:
+        raise RuntimeError("--upload-workers must be positive")
+    if not args.upload_workers <= args.upload_max_concurrency:
+        raise RuntimeError("upload concurrency must satisfy 1 <= initial <= max")
+    if args.status_interval <= 0:
+        raise RuntimeError("--status-interval must be positive")
+    if args.upload_buffer_files < 1:
+        raise RuntimeError("--upload-buffer-files must be positive")
+    if args.upload_batch_files < 1 or args.upload_batch_files > 100:
+        raise RuntimeError("--upload-batch-files must be between 1 and 100")
+    if args.upload_buffer_size < 1:
+        raise RuntimeError("--upload-buffer-size must be positive")
+    if args.hub_attempts < 1:
+        raise RuntimeError("--hub-attempts must be positive")
+    if args.hub_timeout < 1:
+        raise RuntimeError("--hub-timeout must be positive")
+    if args.xet_range_gets < 1:
+        raise RuntimeError("--xet-range-gets must be positive")
+    formats = parse_formats(args.formats)
+    args.prefix = args.prefix.strip("/")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.detached or not sys.stdout.isatty():
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    if os.environ.get("HF_HUB_DISABLE_XET", "").upper() in {"1", "ON", "YES", "TRUE"}:
+        raise RuntimeError("HF_HUB_DISABLE_XET is set; this converter requires Xet")
+    args.xet_cache = args.xet_cache.expanduser().resolve()
+    args.xet_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_XET_CACHE", str(args.xet_cache))
+    try:
+        import hf_xet  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError("hf-xet is required; install it in the active environment") from error
+    os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", str(args.xet_range_gets))
+    if args.xet_high_performance:
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(args.hub_timeout))
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(args.hub_timeout))
+    vx = args.vx.resolve()
+    if not vx.is_file():
+        raise RuntimeError(f"vx binary not found: {vx}; build vortex-tui with unstable_encodings")
+    available_cpus = sorted(os.sched_getaffinity(0))
+    VX_CPU_SLOTS = queue.Queue()
+    for cpu in available_cpus[:min(args.transcode_workers, len(available_cpus))]:
+        VX_CPU_SLOTS.put(cpu)
+    api = hub_api()
+    require_xet_repository(api, args.repo, args.revision, args.hub_attempts)
+    if args.upload_local_dir is None:
+        require_xet_repository(api, args.upload_repo, args.upload_revision, args.hub_attempts)
+    safe_print(
+        f"Xet enabled: range_gets={args.xet_range_gets}, "
+        f"high_performance={args.xet_high_performance}, cache={args.xet_cache}",
+        flush=True,
+    )
+    safe_print(
+        f"Transfer buffers: downloads={args.download_initial_concurrency}-"
+        f"{args.download_max_concurrency} workers/"
+        f"{args.download_buffer_size / 1e9:.1f} GB, uploads={args.upload_workers}-"
+        f"{args.upload_max_concurrency} workers/"
+        f"{args.upload_buffer_size / 1e9:.1f} GB",
+        flush=True,
+    )
+    source_commit = plan["source"]["revision"]
+    checkpoint_path = args.output_dir / "checkpoint.json"
     checkpoint = load_checkpoint(checkpoint_path)
+    current_destination = (resolve_dataset_revision(
+        api, args.upload_repo, args.upload_revision, args.hub_attempts, args.hub_timeout)
+        if args.upload_local_dir is None else plan["destination"]["revision"])
+    resumable_commits = {
+        output.get("upload", {}).get("commit_id")
+        for state in checkpoint.get("files", {}).values()
+        for output in state.get("outputs", {}).values()
+    }
+    resumable_commits.discard(None)
+    if (current_destination != plan["destination"]["revision"]
+            and current_destination not in resumable_commits):
+        raise RuntimeError(
+            f"stale plan: destination {args.upload_repo}@{args.upload_revision} changed from "
+            f"{plan['destination']['revision']} to {current_destination}; create a new plan")
+    create_totals = {
+        fmt: sum(action["action"] == "create"
+                 for chunk in plan["work_chunks"] for action in chunk["actions"]
+                 if action["format"] == fmt)
+        for fmt in formats
+    }
+    if args.upload_local_dir is not None:
+        uploader = LocalCopyUploader(args.upload_local_dir)
+    else:
+        uploader = HuggingFaceBatchUploader(
+            api, args.upload_repo, args.upload_revision, args.upload_batch_files,
+            create_totals, args.hub_attempts, args.hub_timeout,
+            batch_bytes=max(1, args.upload_buffer_size // len(formats)),
+            planned_batches=plan.get("upload_batches", []))
+    run_config = {"repo": args.repo, "requested_revision": args.revision,
+                  "revision": source_commit, "prefix": args.prefix,
+                  "include": args.include, "filters": args.filter, "mode": args.mode, "limit": args.limit,
+                  "target_bytes": args.target_size, "formats": list(formats),
+                  "xet_range_gets": args.xet_range_gets,
+                  "xet_high_performance": args.xet_high_performance,
+                  "xet_cache": str(args.xet_cache),
+                  "seed": args.seed, "uploader": uploader.config() if uploader else None,
+                  "upload_prefix": args.upload_prefix,
+                  "delete_after_upload": args.delete_after_upload, "files": selection}
     previous_config = checkpoint.get("config")
     if (previous_config is not None
             and resumability_config(previous_config) != resumability_config(run_config)):
         raise RuntimeError(
-            f"plan does not match {checkpoint_path}: the source revision or destination "
-            "changed; re-plan into the same destination or use another --output-dir")
+            f"arguments do not match {checkpoint_path}; resume with the same arguments or use another --output-dir")
     checkpoint["config"] = run_config
     checkpoint_lock = threading.Lock()
+    existing_sink_files = {
+        action["destination_path"]: action["existing"]
+        for chunk in plan["work_chunks"] for action in chunk["actions"]
+        if action["action"] == "skip"
+    }
+    for shard in selection:
+        state = checkpoint["files"].setdefault(shard["path"], {"size": shard["size"], "outputs": {}})
+        for fmt in formats:
+            sink_path = destination_path(shard["path"], fmt, args.upload_prefix)
+            remote = existing_sink_files.get(sink_path)
+            if remote is None:
+                continue
+            output_state = state["outputs"].setdefault(fmt, {})
+            output_state["status"] = "complete"
+            output_state["upload"] = {"status": "complete", "hub_path": sink_path,
+                                      "size_bytes": remote.get("size"), "discovered": True}
+            output_state.setdefault("metrics", {
+                "size_bytes": remote.get("size"),
+                "ratio_to_download": remote.get("size") / shard["size"] if remote.get("size") else None,
+                "seconds": None, "mb_per_second": None, "sha256": remote.get("oid")})
     atomic_json(checkpoint_path, checkpoint)
+    atomic_json(args.output_dir / "metrics" / "selection.json", run_config)
 
     def save_checkpoint():
         with checkpoint_lock:
             atomic_json(checkpoint_path, checkpoint)
 
-    def shard_paths(chunk):
-        source_name = chunk["path"]
+    def shard_paths(shard):
+        source_name = shard["path"]
         short_hash = hashlib.sha256(source_name.encode()).hexdigest()[:10]
         stem = source_name[:-len(".parquet")].replace("/", "__") + "__" + short_hash
-        raw_path = output_dir / "downloads" / source_name
-        available = {"parquet-zstd6": output_dir / "parquet-zstd6" / f"{stem}.parquet",
-                     "vortex": output_dir / "vortex" / f"{stem}.vortex",
-                     "vortex-compact": output_dir / "vortex-compact" / f"{stem}.vortex"}
-        return raw_path, {fmt: available[fmt] for fmt in chunk["formats"]}
+        raw_path = args.output_dir / "downloads" / source_name
+        available = {"parquet-zstd6": args.output_dir / "parquet-zstd6" / f"{stem}.parquet",
+                     "vortex": args.output_dir / "vortex" / f"{stem}.vortex",
+                     "vortex-compact": args.output_dir / "vortex-compact" / f"{stem}.vortex"}
+        return raw_path, {fmt: available[fmt] for fmt in formats}
 
-    def chunk_needs_download(chunk):
-        _, outputs = shard_paths(chunk)
-        return needs_source_download(checkpoint["files"].setdefault(
-            chunk["path"], {"size": chunk["size"], "outputs": {}}), outputs)
+    def shard_needs_download(shard):
+        _, outputs = shard_paths(shard)
+        return needs_source_download(checkpoint["files"][shard["path"]], outputs)
 
-    missing_chunks = [chunk for chunk in chunks if chunk_needs_download(chunk)]
-    download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.shard_workers)
-    upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.upload_workers)
+    missing_shards = [shard for shard in selection if shard_needs_download(shard)]
+    download_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(args.download_max_concurrency, max(1, len(missing_shards))))
+    upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.upload_max_concurrency)
     pending_uploads = []
+    upload_control = threading.Condition()
+    upload_active = 0
+    upload_concurrency = args.upload_workers
+    recent_upload_rates = deque(maxlen=4)
     download_futures = {}
     download_sizes = {}
     missing_index = 0
+    download_concurrency = args.download_initial_concurrency
+    recent_download_rates = deque(maxlen=4)
+    pipeline_started = time.monotonic()
+    transfer_totals = {"download_bytes": 0, "download_seconds": 0.0,
+                       "upload_bytes": 0, "upload_seconds": 0.0,
+                       "download_failures": 0, "upload_failures": 0}
+    transfer_totals_lock = threading.Lock()
 
-    def schedule_download(chunk):
-        download_futures[chunk["path"]] = download_executor.submit(
-            download_shard, source_repo, source_commit, chunk,
-            output_dir / "downloads", args.hub_attempts, args.hub_timeout)
-        download_sizes[chunk["path"]] = chunk["size"]
+    def run_adaptive_upload(operation, size_bytes):
+        nonlocal upload_active, upload_concurrency
+        with upload_control:
+            while upload_active >= upload_concurrency:
+                upload_control.wait()
+            upload_active += 1
+        started = time.monotonic()
+        try:
+            return operation()
+        finally:
+            elapsed = max(time.monotonic() - started, 0.001)
+            rate = size_bytes / elapsed
+            with transfer_totals_lock:
+                transfer_totals["upload_bytes"] += size_bytes
+                transfer_totals["upload_seconds"] += elapsed
+            with upload_control:
+                previous = (sum(recent_upload_rates) / len(recent_upload_rates)
+                            if recent_upload_rates else 0)
+                recent_upload_rates.append(rate)
+                if not previous or rate >= previous * 0.95:
+                    upload_concurrency = min(args.upload_max_concurrency, upload_concurrency + 1)
+                elif len(recent_upload_rates) == recent_upload_rates.maxlen and rate < previous * 0.75:
+                    upload_concurrency = max(1, upload_concurrency // 2)
+                upload_active -= 1
+                upload_control.notify_all()
+
+    def schedule_download(shard):
+        download_futures[shard["path"]] = download_executor.submit(
+            download_shard, args.repo, source_commit, shard,
+            args.output_dir / "downloads", args.hub_attempts, args.hub_timeout)
+        download_sizes[shard["path"]] = shard["size"]
 
     def fill_download_window(active_bytes=0):
         nonlocal missing_index
-        while len(download_futures) < args.shard_workers:
-            if missing_index >= len(missing_chunks):
+        while len(download_futures) < min(download_concurrency, args.download_max_concurrency,
+                                          args.download_buffer_files):
+            if missing_index >= len(missing_shards):
                 break
-            next_chunk = missing_chunks[missing_index]
+            next_shard = missing_shards[missing_index]
             inflight_bytes = active_bytes + sum(download_sizes.values())
             if not fits_download_buffer(
-                    inflight_bytes, next_chunk["size"], args.download_buffer_size):
+                    inflight_bytes, next_shard["size"], args.download_buffer_size):
                 break
-            schedule_download(next_chunk)
+            schedule_download(next_shard)
             missing_index += 1
 
     fill_download_window()
@@ -863,98 +1144,64 @@ def execute_source(api, plan, source, args, vx):
                                               "batch_total_files": result.get("total_files")}
                     output_state["local_deleted"] = args.delete_after_upload
             atomic_json(checkpoint_path, checkpoint)
-
-    for position, chunk in enumerate(chunks, 1):
-        source_name = chunk["path"]
-        raw, outputs = shard_paths(chunk)
-        safe_print(
-            f"[{position}/{len(chunks)}] {source_name} ({chunk['size'] / 1e9:.2f} GB, "
-            f"formats: {', '.join(chunk['formats'])})",
-            flush=True,
-        )
-        state = checkpoint["files"].setdefault(source_name, {"size": chunk["size"], "outputs": {}})
-        completed_outputs = []
-        for fmt, destination_file in outputs.items():
-            output_state = state["outputs"].get(fmt, {})
-            upload_complete = output_state.get("upload", {}).get("status") == "complete"
-            if output_state.get("status") == "complete" and upload_complete:
-                completed_outputs.append(fmt)
-        if len(completed_outputs) == len(outputs):
-            state["status"] = "complete"
-            save_checkpoint()
-            safe_print("  checkpoint complete; nothing to do", flush=True)
-            continue
-        if source_name in download_futures:
-            state["status"] = "downloading"
-            save_checkpoint()
-            try:
-                downloaded_path, download_seconds = download_futures.pop(source_name).result()
-                download_sizes.pop(source_name)
-                if downloaded_path.resolve() != raw.resolve():
-                    raise RuntimeError(f"Hub download returned unexpected path: {downloaded_path}")
-                fill_download_window(active_bytes=chunk["size"])
-                state["download"] = {"status": "complete", "path": str(raw),
-                                     "size_bytes": chunk["size"], "seconds": download_seconds}
-                state["status"] = "converting"
-                state.pop("error", None)
-                save_checkpoint()
-                safe_print(
-                    f"  downloaded {chunk['size'] / 1e9:.2f} GB in {download_seconds:.1f}s",
-                    flush=True,
-                )
-            except Exception as error:
-                state["status"] = "failed"
-                state["error"] = f"download: {error}"
-                save_checkpoint()
-                raise
-        else:
-            state["status"] = "uploading"
-            save_checkpoint()
+    def process_downloaded_shard(position, shard, source_name, raw, outputs, state):
         all_jobs = {"parquet-zstd6": lambda: parquet_zstd6(raw, outputs["parquet-zstd6"]),
                     "vortex": lambda: run_vx(vx, raw, outputs["vortex"], "btrblocks"),
                     "vortex-compact": lambda: run_vx(vx, raw, outputs["vortex-compact"], "compact")}
-        jobs = tuple((fmt, all_jobs[fmt]) for fmt in chunk["formats"])
-
+        jobs = tuple((fmt, all_jobs[fmt]) for fmt in formats)
         def process_format(fmt, job):
-            destination_file = outputs[fmt]
+            destination = outputs[fmt]
             output_state = state["outputs"].setdefault(fmt, {})
             upload_complete = output_state.get("upload", {}).get("status") == "complete"
-            local_complete = (destination_file.exists() and
-                              destination_file.stat().st_size
-                              == output_state.get("metrics", {}).get("size_bytes"))
-            if output_state.get("status") == "complete" and upload_complete:
+            local_complete = (destination.exists() and
+                              destination.stat().st_size == output_state.get("metrics", {}).get("size_bytes"))
+            durable_complete = upload_complete if uploader else local_complete
+            complete = output_state.get("status") == "complete" and durable_complete
+            if complete:
                 size = output_state["metrics"]["size_bytes"]
-                safe_print(f"  {fmt}: checkpoint complete ({size / 1e9:.2f} GB)", flush=True)
+                location = "Hub" if not destination.exists() else "local"
+                safe_print(
+                    f"  {fmt}: checkpoint complete ({size / 1e9:.2f} GB, {location})",
+                    flush=True,
+                )
                 return
             if not local_complete:
                 output_state["status"] = "converting"
-                output_state["path"] = str(destination_file)
-                save_checkpoint()
+                output_state["path"] = str(destination)
+                with checkpoint_lock:
+                    atomic_json(checkpoint_path, checkpoint)
                 try:
                     seconds = job()
-                    output_state["metrics"] = metric(source_name, fmt, destination_file,
-                                                     chunk["size"], seconds)
+                    output_state["metrics"] = metric(source_name, fmt, destination, shard["size"], seconds)
                     output_state["metrics"].pop("source")
                     output_state["metrics"].pop("format")
                     output_state["status"] = "complete"
                     output_state.pop("error", None)
-                    save_checkpoint()
+                    with checkpoint_lock:
+                        atomic_json(checkpoint_path, checkpoint)
                 except Exception as error:
                     output_state["status"] = "failed"
                     output_state["error"] = str(error)
                     state["status"] = "failed"
                     state["error"] = f"{fmt}: {error}"
-                    save_checkpoint()
+                    with checkpoint_lock:
+                        atomic_json(checkpoint_path, checkpoint)
                     raise
-                safe_print(f"  {fmt}: {destination_file.stat().st_size / 1e9:.2f} GB", flush=True)
+                safe_print(
+                    f"  {fmt}: {destination.stat().st_size / 1e9:.2f} GB",
+                    flush=True,
+                )
             else:
                 safe_print(f"  {fmt}: reusing local encoding for upload", flush=True)
-            if output_state.get("upload", {}).get("status") != "complete":
-                sink_path = chunk["sinks"][fmt]
+            if uploader and output_state.get("upload", {}).get("status") != "complete":
+                sink_path = destination_path(source_name, fmt, args.upload_prefix)
                 output_state["upload"] = {"status": "queued", "hub_path": sink_path}
-                save_checkpoint()
+                with checkpoint_lock:
+                    atomic_json(checkpoint_path, checkpoint)
 
                 def record_upload_failure(error):
+                    with transfer_totals_lock:
+                        transfer_totals["upload_failures"] += 1
                     with checkpoint_lock:
                         output_state["upload"] = {"status": "failed", "hub_path": sink_path,
                                                   "error": str(error)}
@@ -962,13 +1209,13 @@ def execute_source(api, plan, source, args, vx):
                         state["error"] = f"upload {fmt}: {error}"
                         atomic_json(checkpoint_path, checkpoint)
 
-                def upload_task():
+                def do_upload_task():
                     with checkpoint_lock:
                         output_state["upload"] = {"status": "uploading", "hub_path": sink_path}
                         atomic_json(checkpoint_path, checkpoint)
                     if isinstance(uploader, HuggingFaceBatchUploader):
                         try:
-                            upload = uploader.upload(destination_file, sink_path,
+                            upload = uploader.upload(destination, sink_path,
                                                      format_name=fmt, ordinal=position)
                         except Exception as error:
                             record_upload_failure(error)
@@ -984,7 +1231,7 @@ def execute_source(api, plan, source, args, vx):
                     else:
                         try:
                             upload = upload_then_maybe_delete(
-                                uploader, destination_file, sink_path, args.delete_after_upload)
+                                uploader, destination, sink_path, args.delete_after_upload)
                         except Exception as error:
                             record_upload_failure(error)
                             raise
@@ -993,6 +1240,9 @@ def execute_source(api, plan, source, args, vx):
                             output_state["local_deleted"] = upload["local_deleted"]
                             atomic_json(checkpoint_path, checkpoint)
                         safe_print(f"    uploaded: {upload['url']}", flush=True)
+
+                def upload_task():
+                    return run_adaptive_upload(do_upload_task, destination.stat().st_size)
 
                 pending_uploads.append(upload_executor.submit(upload_task))
 
@@ -1004,15 +1254,148 @@ def execute_source(api, plan, source, args, vx):
             raw.unlink(missing_ok=True)
             if "download" in state:
                 state["download"]["retained"] = False
-        elif "download" in state:
-            state["download"]["retained"] = True
+        else:
+            if "download" in state:
+                state["download"]["retained"] = True
         state["status"] = "complete"
         state.pop("error", None)
         save_checkpoint()
-        fill_download_window()
-        max_pending_uploads = args.upload_workers * max(1, len(totals))
-        while len(pending_uploads) >= max_pending_uploads:
-            pending_uploads.pop(0).result()
+
+    transcode_slots = max(1, args.transcode_workers // max(1, len(formats)))
+    conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=transcode_slots)
+    conversion_futures = []
+
+    def submit_conversion(position, shard, raw, outputs, state):
+        source_name = shard["path"]
+        state["status"] = "converting"
+        state.pop("error", None)
+        save_checkpoint()
+        conversion_futures.append(conversion_executor.submit(
+            process_downloaded_shard, position, shard, source_name, raw, outputs, state))
+
+    # Admit resumable local sources immediately. Network downloads below are admitted in
+    # completion order, so one slow low-ordinal shard cannot strand ready CPU work.
+    positions = {shard["path"]: position for position, shard in enumerate(selection, 1)}
+    shards_by_name = {shard["path"]: shard for shard in selection}
+    for position, shard in enumerate(selection, 1):
+        source_name = shard["path"]
+        raw, outputs = shard_paths(shard)
+        safe_print(
+            f"[{position}/{len(selection)}] {source_name} ({shard['size'] / 1e9:.2f} GB)",
+            flush=True,
+        )
+        state = checkpoint["files"].setdefault(source_name, {"size": shard["size"], "outputs": {}})
+        completed_outputs = []
+        for fmt, destination in outputs.items():
+            output_state = state["outputs"].get(fmt, {})
+            upload_complete = output_state.get("upload", {}).get("status") == "complete"
+            local_complete = (destination.exists() and
+                              destination.stat().st_size == output_state.get("metrics", {}).get("size_bytes"))
+            durable_complete = upload_complete if uploader else local_complete
+            if output_state.get("status") == "complete" and durable_complete:
+                completed_outputs.append(fmt)
+        if len(completed_outputs) == len(outputs):
+            state["status"] = "complete"
+            save_checkpoint()
+            safe_print(
+                "  file checkpoint/sink scan complete; no download or conversion needed",
+                flush=True,
+            )
+            continue
+        if source_name not in download_futures and not shard_needs_download(shard):
+            submit_conversion(position, shard, raw, outputs, state)
+
+    def status_snapshot():
+        with checkpoint_lock:
+            files = list(checkpoint["files"].values())
+            outputs = [output for state in files for output in state.get("outputs", {}).values()]
+        source_done = sum(state.get("status") == "complete" for state in files)
+        converted = sum(output.get("status") == "complete" for output in outputs)
+        uploaded = sum(output.get("upload", {}).get("status") == "complete"
+                       for output in outputs)
+        preuploaded = sum(output.get("upload", {}).get("status") == "preuploaded"
+                          for output in outputs)
+        with transfer_totals_lock:
+            totals = dict(transfer_totals)
+        elapsed = max(time.monotonic() - pipeline_started, 0.001)
+        conversion_source_bytes = sum(
+            state["size"] for state in files for output in state.get("outputs", {}).values()
+            if output.get("status") == "complete" and output.get("metrics", {}).get("seconds"))
+        return {
+            "queues": {
+                "download": {"waiting_items": len(missing_shards) - missing_index,
+                             "active_items": len(download_futures),
+                             "reserved_bytes": sum(download_sizes.values())},
+                "transcode": {"waiting_items": sum(not future.running() and not future.done()
+                                                          for future in conversion_futures),
+                              "active_items": sum(future.running() for future in conversion_futures),
+                              "succeeded_items": sum(future.done() and future.exception() is None
+                                                     for future in conversion_futures),
+                              "active_cpu_slots": args.transcode_workers - VX_CPU_SLOTS.qsize()},
+                "upload": {"waiting_items": sum(not future.running() and not future.done()
+                                                       for future in pending_uploads),
+                           "active_items": upload_active,
+                           "succeeded_items": sum(future.done() and future.exception() is None
+                                                  for future in pending_uploads),
+                           "concurrency": upload_concurrency},
+            },
+            "progress": {"source_complete": source_done, "source_total": len(selection),
+                         "outputs_converted": converted,
+                         "outputs_uploaded": uploaded, "outputs_preuploaded": preuploaded},
+            "limits": {"download_files": args.download_buffer_files,
+                       "download_bytes": args.download_buffer_size,
+                       "upload_files": args.upload_buffer_files,
+                       "upload_bytes": args.upload_buffer_size},
+            "throughput": {
+                "download_effective_bytes_per_second": totals["download_bytes"] / elapsed,
+                "download_worker_bytes_per_second": totals["download_bytes"]
+                    / max(totals["download_seconds"], 0.001),
+                "conversion_source_bytes_per_second": conversion_source_bytes / elapsed,
+                "upload_effective_bytes_per_second": totals["upload_bytes"] / elapsed,
+                "upload_worker_bytes_per_second": totals["upload_bytes"]
+                    / max(totals["upload_seconds"], 0.001),
+            },
+            "failures": {"download": totals["download_failures"],
+                         "upload": totals["upload_failures"]},
+        }
+
+    status = LiveStatus(args.output_dir / "status.json", args.status_interval, status_snapshot)
+    status.start()
+    try:
+        for source_name, completed in completed_futures(download_futures):
+                download_sizes.pop(source_name)
+                shard = shards_by_name[source_name]
+                raw, outputs = shard_paths(shard)
+                state = checkpoint["files"][source_name]
+                try:
+                    downloaded_path, download_seconds = completed.result()
+                    if downloaded_path.resolve() != raw.resolve():
+                        raise RuntimeError(f"Hub download returned unexpected path: {downloaded_path}")
+                    state["download"] = {"status": "complete", "path": str(raw),
+                                         "size_bytes": shard["size"], "seconds": download_seconds}
+                    rate = shard["size"] / max(download_seconds, 0.001)
+                    recent_download_rates.append(rate)
+                    with transfer_totals_lock:
+                        transfer_totals["download_bytes"] += shard["size"]
+                        transfer_totals["download_seconds"] += download_seconds
+                    submit_conversion(positions[source_name], shard, raw, outputs, state)
+                    safe_print(f"[{positions[source_name]}/{len(selection)}] downloaded "
+                               f"{source_name} in {download_seconds:.1f}s", flush=True)
+                except Exception as error:
+                    with transfer_totals_lock:
+                        transfer_totals["download_failures"] += 1
+                    state["status"] = "failed"
+                    state["error"] = f"download: {error}"
+                    save_checkpoint()
+                    raise
+                fill_download_window()
+                while len(pending_uploads) >= args.upload_buffer_files:
+                    pending_uploads.pop(0).result()
+    finally:
+        status.write()
+    for future in concurrent.futures.as_completed(conversion_futures):
+        future.result()
+    conversion_executor.shutdown(wait=True, cancel_futures=True)
     download_executor.shutdown(wait=True, cancel_futures=True)
     for future in pending_uploads:
         future.result()
@@ -1021,181 +1404,9 @@ def execute_source(api, plan, source, args, vx):
         for final_batch in uploader.flush():
             apply_committed_batch(final_batch)
             safe_print(f"    committed final batch: {final_batch['url']}", flush=True)
-    write_reports(checkpoint, output_dir, chunks)
-
-
-def configure_xet(args):
-    if os.environ.get("HF_HUB_DISABLE_XET", "").upper() in {"1", "ON", "YES", "TRUE"}:
-        raise RuntimeError("HF_HUB_DISABLE_XET is set; this sync requires Xet")
-    args.xet_cache = args.xet_cache.expanduser().resolve()
-    args.xet_cache.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_XET_CACHE", str(args.xet_cache))
-    try:
-        import hf_xet  # noqa: F401
-    except ImportError as error:
-        raise RuntimeError("hf-xet is required; install it in the active environment") from error
-    os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", str(args.xet_range_gets))
-    if args.xet_high_performance:
-        os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(args.hub_timeout))
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(args.hub_timeout))
-
-
-def run_command(args):
-    plan = load_plan(args.plan)
-    needs_vortex = any(fmt != "parquet-zstd6"
-                       for source in plan["sources"]
-                       for chunk in source["chunks"]
-                       for fmt in chunk["formats"])
-    vx = args.vx.resolve()
-    if needs_vortex and not vx.is_file():
-        raise RuntimeError(f"vx binary not found: {vx}; build vortex-tui with unstable_encodings")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    configure_xet(args)
-    api = hub_api()
-    destination = plan["destination"]
-    total = sum(len(source["chunks"]) for source in plan["sources"])
-    safe_print(
-        f"Executing plan {args.plan} ({plan['created']}): {total} files into "
-        f"{destination.get('repo') or destination.get('local_dir')}",
-        flush=True,
-    )
-    safe_print(
-        f"Xet: range_gets={args.xet_range_gets}, "
-        f"high_performance={args.xet_high_performance}, cache={args.xet_cache}; "
-        f"buffers: downloads={args.shard_workers} workers/"
-        f"{args.download_buffer_size / 1e9:.1f} GB, uploads={args.upload_workers} workers/"
-        f"{args.upload_buffer_size / 1e9:.1f} GB",
-        flush=True,
-    )
-    for source in plan["sources"]:
-        execute_source(api, plan, source, args, vx)
+    write_reports(checkpoint, args.output_dir, selection)
+    status.close()
     return 0
-
-
-# ------------------------------------------------------------------------------- CLI
-
-
-def parse_formats(value):
-    formats = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
-    if not formats or not set(formats) <= set(SUPPORTED_FORMATS):
-        raise RuntimeError("--formats must contain " + ", ".join(SUPPORTED_FORMATS))
-    return formats
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    plan = commands.add_parser(
-        "plan", help="diff sources against the destination and write the work plan",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    plan.add_argument("--plan", type=Path, default=DEFAULT_PLAN_PATH,
-                      help="where to write the plan JSON")
-    plan.add_argument("--sources", type=Path,
-                      help="JSON file with a list of source repos: "
-                           '[{"repo": "org/name", "revision": "main", "prefix": "data", '
-                           '"include": "*.parquet", "filters": [], "mode": "all"}]')
-    plan.add_argument("--repo", help="single source Hugging Face dataset repository")
-    plan.add_argument("--revision", default="main",
-                      help="source branch, tag, or commit for --repo (resolved to a commit)")
-    plan.add_argument("--prefix", default="",
-                      help="source repository folder for --repo; empty scans the root")
-    plan.add_argument("--include", default="*.parquet",
-                      help="glob matched against paths below the prefix")
-    plan.add_argument("--filter", action="append", default=[],
-                      help="repeatable full repository-path glob, e.g. 'sample/10BT/*'")
-    plan.add_argument("--mode", choices=("sample", "first", "all"), default="all",
-                      help="plan every shard, the first --limit shards, or an even sample")
-    plan.add_argument("--limit", type=int, default=10,
-                      help="number of ordered shards selected by --mode first")
-    plan.add_argument("--target-size", type=parse_size, default=DEFAULT_TARGET_BYTES,
-                      help="approximate bytes selected by --mode sample")
-    plan.add_argument("--seed", type=int, default=0)
-    plan.add_argument("--formats", default=",".join(SUPPORTED_FORMATS),
-                      help="comma-separated outputs")
-    plan.add_argument("--upload-repo",
-                      help="vortex-data destination dataset repo diffed against and synced into")
-    plan.add_argument("--upload-local-dir", type=Path,
-                      help="test destination: a local Hub-shaped fixture directory")
-    plan.add_argument("--upload-revision", default="main")
-    plan.add_argument("--upload-prefix", default="",
-                      help="destination directory within the destination repo")
-    plan.add_argument("--hub-attempts", type=int, default=5)
-    plan.add_argument("--hub-timeout", type=int, default=30)
-
-    run = commands.add_parser(
-        "run", help="execute a previously written plan",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    run.add_argument("--plan", type=Path, default=DEFAULT_PLAN_PATH,
-                     help="plan JSON written by the plan command")
-    run.add_argument("--output-dir", type=Path, default=DEFAULT_DATA_DIR)
-    run.add_argument("--vx", type=Path, default=Path("target/release/vx"))
-    run.add_argument("--format-workers", type=int, default=3,
-                     help="maximum concurrent encoders per downloaded shard")
-    run.add_argument("--shard-workers", type=int, default=2,
-                     help="maximum concurrent source downloads")
-    run.add_argument("--download-buffer-size", type=parse_size,
-                     default=DEFAULT_DOWNLOAD_BUFFER_BYTES,
-                     help="maximum source bytes downloaded or in flight")
-    run.add_argument("--upload-workers", type=int, default=2,
-                     help="maximum concurrent preuploads")
-    run.add_argument("--upload-batch-files", type=int, default=100,
-                     help="files per format in each Hub commit")
-    run.add_argument("--upload-buffer-size", type=parse_size,
-                     default=DEFAULT_UPLOAD_BUFFER_BYTES,
-                     help="approximate local output bytes awaiting Hub commits, divided "
-                          "evenly across formats")
-    run.add_argument("--hub-attempts", type=int, default=5)
-    run.add_argument("--hub-timeout", type=int, default=30)
-    run.add_argument("--xet-range-gets", type=int, default=4,
-                     help="concurrent Xet byte ranges downloaded per file")
-    run.add_argument("--xet-cache", type=Path, default=DEFAULT_XET_CACHE,
-                     help="local Xet chunk/shard cache")
-    run.add_argument("--xet-high-performance", action="store_true",
-                     help="allow Xet to maximize host CPU, disk, and network utilization")
-    run.add_argument("--keep-downloads", action="store_true")
-    run.add_argument("--delete-after-upload", action="store_true",
-                     help="remove encoded local files only after checkpointed upload success")
-    return parser.parse_args(argv)
-
-
-def validate_args(args):
-    if args.command == "plan":
-        if args.upload_repo and args.upload_local_dir:
-            raise RuntimeError("--upload-repo and --upload-local-dir are mutually exclusive")
-        if not args.upload_repo and not args.upload_local_dir:
-            raise RuntimeError("pass --upload-repo or --upload-local-dir")
-        if args.limit < 1:
-            raise RuntimeError("--limit must be positive")
-    else:
-        if args.format_workers < 1 or args.format_workers > 3:
-            raise RuntimeError("--format-workers must be between 1 and 3")
-        if args.shard_workers < 1:
-            raise RuntimeError("--shard-workers must be positive")
-        if args.download_buffer_size < 1:
-            raise RuntimeError("--download-buffer-size must be positive")
-        if args.upload_workers < 1:
-            raise RuntimeError("--upload-workers must be positive")
-        if args.upload_batch_files < 1 or args.upload_batch_files > 100:
-            raise RuntimeError("--upload-batch-files must be between 1 and 100")
-        if args.upload_buffer_size < 1:
-            raise RuntimeError("--upload-buffer-size must be positive")
-        if args.xet_range_gets < 1:
-            raise RuntimeError("--xet-range-gets must be positive")
-    if args.hub_attempts < 1:
-        raise RuntimeError("--hub-attempts must be positive")
-    if args.hub_timeout < 1:
-        raise RuntimeError("--hub-timeout must be positive")
-
-
-def main():
-    args = parse_args()
-    validate_args(args)
-    if args.command == "plan":
-        return plan_command(args)
-    return run_command(args)
 
 
 if __name__ == "__main__":

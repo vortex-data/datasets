@@ -1,0 +1,5 @@
+[tool.uv]
+required-version = ">=0.8.0"
+
+[tool.uv.workspace]
+members = ["scripts"]
