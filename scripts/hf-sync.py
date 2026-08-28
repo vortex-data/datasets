@@ -232,31 +232,38 @@ def list_repository_files(api, repo, revision, prefix="", attempts=3):
     return files
 
 
-def download_shard(repo, revision, shard, download_root, attempts, etag_timeout):
-    from huggingface_hub import hf_hub_download
+def download_shard_batch(repo, revision, shards, download_root, attempts, etag_timeout):
+    """Download and verify several shards through one concurrent Hub request."""
+    from huggingface_hub import snapshot_download
 
     started = time.monotonic()
-    path = Path(
+    root = Path(
         retry_call(
-            lambda: hf_hub_download(
+            lambda: snapshot_download(
                 repo,
-                shard["path"],
                 repo_type="dataset",
                 revision=revision,
+                allow_patterns=[shard["path"] for shard in shards],
                 local_dir=download_root,
+                max_workers=len(shards),
                 etag_timeout=etag_timeout,
             ),
             attempts,
         )
     )
-    elapsed = time.monotonic() - started
-    actual_size = path.stat().st_size
-    if actual_size != shard["size"]:
-        raise RuntimeError(f"downloaded {actual_size} bytes for {path}, expected {shard['size']}")
-    if shard.get("sha256") and file_sha256(path) != shard["sha256"]:
-        path.unlink(missing_ok=True)
-        raise RuntimeError(f"SHA-256 mismatch for {shard['path']}")
-    return path, elapsed
+    elapsed = max(time.monotonic() - started, 0.001)
+    total_bytes = sum(shard["size"] for shard in shards)
+    results = []
+    for shard in shards:
+        path = root / shard["path"]
+        actual_size = path.stat().st_size
+        if actual_size != shard["size"]:
+            raise RuntimeError(f"downloaded {actual_size} bytes for {path}, expected {shard['size']}")
+        if shard.get("sha256") and file_sha256(path) != shard["sha256"]:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(f"SHA-256 mismatch for {shard['path']}")
+        results.append((shard, path, elapsed * shard["size"] / max(total_bytes, 1)))
+    return results
 
 
 def parquet_zstd6(source, destination):
@@ -322,6 +329,10 @@ class Uploader(abc.ABC):
         """Return existing sink files keyed by destination path."""
         return {}
 
+    def upload_batch(self, items):
+        """Upload a claimed batch; backends may override this with a native batch call."""
+        return [self.upload(**item) for item in items]
+
 
 class HuggingFaceBatchUploader(Uploader):
     """Preupload outputs and commit up to a fixed file count per format."""
@@ -348,39 +359,76 @@ class HuggingFaceBatchUploader(Uploader):
         self.lock = threading.Lock()
 
     def upload(self, local_path, destination_path, *, format_name, ordinal, **metadata):
+        return self.upload_batch(
+            [
+                {
+                    "local_path": local_path,
+                    "destination_path": destination_path,
+                    "format_name": format_name,
+                    "ordinal": ordinal,
+                }
+            ]
+        )[0]
+
+    def upload_batch(self, items):
         from huggingface_hub import CommitOperationAdd
 
-        operation = CommitOperationAdd(path_in_repo=destination_path, path_or_fileobj=local_path)
         started = time.monotonic()
+        operations = [
+            CommitOperationAdd(path_in_repo=item["destination_path"], path_or_fileobj=item["local_path"])
+            for item in items
+        ]
         retry_call(
             lambda: self.api.preupload_lfs_files(
-                self.repo, additions=[operation], repo_type="dataset", revision=self.revision, num_threads=1
+                self.repo,
+                additions=operations,
+                repo_type="dataset",
+                revision=self.revision,
+                num_threads=len(operations),
             ),
             self.attempts,
         )
-        entry = {
-            "operation": operation,
-            "local_path": str(local_path),
-            "hub_path": destination_path,
-            "size_bytes": local_path.stat().st_size,
-            "format": format_name,
-            "ordinal": ordinal,
-        }
+        results = []
         with self.lock:
-            pending_key = self.batch_for_path.get(destination_path, format_name)
-            if self.planned_batches and pending_key == format_name:
-                raise RuntimeError(f"destination is not present in the action plan: {destination_path}")
-            pending = self.pending[pending_key]
-            pending.append(entry)
-            if self.planned_batches:
-                expected = len(self.planned_batches[pending_key]["destination_paths"])
-                if len(pending) == expected:
-                    return self._flush_format_locked(pending_key)
-                return {"status": "preuploaded", "hub_path": destination_path, "seconds": time.monotonic() - started}
-            pending_bytes = sum(item["size_bytes"] for item in pending)
-            if len(pending) >= self.batch_files or (self.batch_bytes is not None and pending_bytes >= self.batch_bytes):
-                return self._flush_format_locked(format_name)
-        return {"status": "preuploaded", "hub_path": destination_path, "seconds": time.monotonic() - started}
+            for item, operation in zip(items, operations, strict=True):
+                destination_path = item["destination_path"]
+                format_name = item["format_name"]
+                entry = {
+                    "operation": operation,
+                    "local_path": str(item["local_path"]),
+                    "hub_path": destination_path,
+                    "size_bytes": item["local_path"].stat().st_size,
+                    "format": format_name,
+                    "ordinal": item["ordinal"],
+                }
+                pending_key = self.batch_for_path.get(destination_path, format_name)
+                if self.planned_batches and pending_key == format_name:
+                    raise RuntimeError(f"destination is not present in the action plan: {destination_path}")
+                pending = self.pending[pending_key]
+                pending.append(entry)
+                if self.planned_batches:
+                    expected = len(self.planned_batches[pending_key]["destination_paths"])
+                    if len(pending) == expected:
+                        results.append(self._flush_format_locked(pending_key))
+                    else:
+                        results.append(
+                            {
+                                "status": "preuploaded",
+                                "hub_path": destination_path,
+                                "seconds": time.monotonic() - started,
+                            }
+                        )
+                    continue
+                pending_bytes = sum(entry["size_bytes"] for entry in pending)
+                if len(pending) >= self.batch_files or (
+                    self.batch_bytes is not None and pending_bytes >= self.batch_bytes
+                ):
+                    results.append(self._flush_format_locked(format_name))
+                else:
+                    results.append(
+                        {"status": "preuploaded", "hub_path": destination_path, "seconds": time.monotonic() - started}
+                    )
+        return results
 
     def flush(self):
         with self.lock:
@@ -563,14 +611,19 @@ def adapt_concurrency(current, maximum, recent_rates, rate):
     return current
 
 
-def completed_futures(futures):
-    """Yield (key, future) in completion order, removing each from the input mapping."""
-    while futures:
-        done, _ = concurrent.futures.wait(futures.values(), return_when=concurrent.futures.FIRST_COMPLETED)
-        for completed in done:
-            key = next(key for key, future in futures.items() if future is completed)
-            futures.pop(key)
-            yield key, completed
+def choose_work_stage(*, upload_waiting, upload_high, download_available, convert_waiting, active):
+    """Choose work using disk safety, refill, drain, then conversion priority."""
+    if upload_high:
+        return "upload"
+    if download_available:
+        return "download"
+    if upload_waiting:
+        return "upload"
+    if convert_waiting:
+        return "convert"
+    if not active:
+        return "done"
+    return None
 
 
 def needs_source_download(file_state, outputs):
@@ -768,20 +821,20 @@ def add_selection_arguments(parser):
 def add_operational_arguments(parser):
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--vx", type=Path, default=Path("target/release/vx"))
-    parser.add_argument("--format-workers", type=int, default=3)
+    parser.add_argument("--workers", type=int, help="workers in the unified download/upload/convert pool")
+    parser.add_argument("--format-workers", type=int, default=3, help="deprecated; formats run sequentially per job")
     parser.add_argument(
         "--transcode-workers",
         type=int,
-        default=max(1, os.cpu_count() or 1),
-        help="maximum single-core transcodes active across downloaded shards",
+        help="deprecated alias for --workers",
     )
-    parser.add_argument("--shard-workers", type=int, default=2, help="initial downloads (deprecated alias)")
-    parser.add_argument("--download-initial-concurrency", type=int)
-    parser.add_argument("--download-max-concurrency", type=int, default=8)
+    parser.add_argument("--shard-workers", type=int, default=2, help="deprecated download batch-size alias")
+    parser.add_argument("--download-initial-concurrency", type=int, help="initial adaptive download batch size")
+    parser.add_argument("--download-max-concurrency", type=int, default=8, help="maximum download batch size")
     parser.add_argument("--download-buffer-files", type=int, default=100)
     parser.add_argument("--download-buffer-size", type=parse_size, default=DEFAULT_DOWNLOAD_BUFFER_BYTES)
-    parser.add_argument("--upload-workers", type=int, default=2)
-    parser.add_argument("--upload-max-concurrency", type=int, default=8)
+    parser.add_argument("--upload-workers", type=int, default=2, help="initial adaptive upload batch size")
+    parser.add_argument("--upload-max-concurrency", type=int, default=8, help="maximum upload batch size")
     parser.add_argument("--upload-local-dir", type=Path, help="copy outputs to a local sink instead of Hugging Face")
     parser.add_argument("--upload-buffer-files", type=int, default=100)
     parser.add_argument("--upload-batch-files", type=int, default=100)
@@ -1016,8 +1069,12 @@ def main():
     selection = apply_plan_arguments(args, plan)
     if args.format_workers < 1 or args.format_workers > 3:
         raise RuntimeError("--format-workers must be between 1 and 3")
-    if args.transcode_workers < 1:
-        raise RuntimeError("--transcode-workers must be positive")
+    if args.workers is None:
+        args.workers = args.transcode_workers or max(1, os.cpu_count() or 1)
+    elif args.transcode_workers is not None:
+        raise RuntimeError("use --workers or deprecated --transcode-workers, not both")
+    if args.workers < 1:
+        raise RuntimeError("--workers must be positive")
     if args.shard_workers < 1:
         raise RuntimeError("--shard-workers must be positive")
     if args.download_initial_concurrency is None:
@@ -1070,7 +1127,8 @@ def main():
         raise RuntimeError(f"vx binary not found: {vx}; build vortex-tui with unstable_encodings")
     available_cpus = sorted(os.sched_getaffinity(0))
     VX_CPU_SLOTS = queue.Queue()
-    for cpu in available_cpus[: min(args.transcode_workers, len(available_cpus))]:
+    cpu_slots = available_cpus[: min(args.workers, len(available_cpus))]
+    for cpu in cpu_slots:
         VX_CPU_SLOTS.put(cpu)
     api = hub_api()
     require_xet_repository(api, args.repo, args.revision, args.hub_attempts)
@@ -1082,10 +1140,9 @@ def main():
         flush=True,
     )
     safe_print(
-        f"Transfer buffers: downloads={args.download_initial_concurrency}-"
-        f"{args.download_max_concurrency} workers/"
-        f"{args.download_buffer_size / 1e9:.1f} GB, uploads={args.upload_workers}-"
-        f"{args.upload_max_concurrency} workers/"
+        f"Unified pool: workers={args.workers}, download_batch={args.download_initial_concurrency}-"
+        f"{args.download_max_concurrency} files/{args.download_buffer_size / 1e9:.1f} GB, "
+        f"upload_batch={args.upload_workers}-{args.upload_max_concurrency} files/"
         f"{args.upload_buffer_size / 1e9:.1f} GB",
         flush=True,
     )
@@ -1213,19 +1270,18 @@ def main():
         return needs_source_download(checkpoint["files"][shard["path"]], outputs)
 
     missing_shards = [shard for shard in selection if shard_needs_download(shard)]
-    download_executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(args.download_max_concurrency, max(1, len(missing_shards)))
-    )
-    upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.upload_max_concurrency)
-    pending_uploads = deque()
-    upload_control = threading.Condition()
-    upload_active = 0
-    upload_concurrency = args.upload_workers
+    work_condition = threading.Condition()
+    download_queue = deque(missing_shards)
+    conversion_queue = deque()
+    upload_queue = deque()
+    active_work = {"download": 0, "convert": 0, "upload": 0}
+    download_reserved_files = 0
+    download_reserved_bytes = 0
+    upload_reserved_bytes = 0
+    worker_failure = []
+    download_batch_size = args.download_initial_concurrency
+    upload_batch_size = args.upload_workers
     recent_upload_rates = deque(maxlen=4)
-    download_futures = {}
-    download_sizes = {}
-    missing_index = 0
-    download_concurrency = args.download_initial_concurrency
     recent_download_rates = deque(maxlen=4)
     pipeline_started = time.monotonic()
     transfer_totals = {
@@ -1237,56 +1293,6 @@ def main():
         "upload_failures": 0,
     }
     transfer_totals_lock = threading.Lock()
-
-    def run_adaptive_upload(operation, size_bytes):
-        nonlocal upload_active, upload_concurrency
-        with upload_control:
-            while upload_active >= upload_concurrency:
-                upload_control.wait()
-            upload_active += 1
-        started = time.monotonic()
-        try:
-            return operation()
-        finally:
-            elapsed = max(time.monotonic() - started, 0.001)
-            rate = size_bytes / elapsed
-            with transfer_totals_lock:
-                transfer_totals["upload_bytes"] += size_bytes
-                transfer_totals["upload_seconds"] += elapsed
-            with upload_control:
-                upload_concurrency = adapt_concurrency(
-                    upload_concurrency, args.upload_max_concurrency, recent_upload_rates, rate
-                )
-                upload_active -= 1
-                upload_control.notify_all()
-
-    def schedule_download(shard):
-        download_futures[shard["path"]] = download_executor.submit(
-            download_shard,
-            args.repo,
-            source_commit,
-            shard,
-            args.output_dir / "downloads",
-            args.hub_attempts,
-            args.hub_timeout,
-        )
-        download_sizes[shard["path"]] = shard["size"]
-
-    def fill_download_window(active_bytes=0):
-        nonlocal missing_index
-        while len(download_futures) < min(
-            download_concurrency, args.download_max_concurrency, args.download_buffer_files
-        ):
-            if missing_index >= len(missing_shards):
-                break
-            next_shard = missing_shards[missing_index]
-            inflight_bytes = active_bytes + sum(download_sizes.values())
-            if not fits_download_buffer(inflight_bytes, next_shard["size"], args.download_buffer_size):
-                break
-            schedule_download(next_shard)
-            missing_index += 1
-
-    fill_download_window()
 
     def apply_committed_batch(result):
         if not result.get("committed"):
@@ -1372,57 +1378,23 @@ def main():
                 output_state["upload"] = {"status": "queued", "hub_path": sink_path}
                 with checkpoint_lock:
                     atomic_json(checkpoint_path, checkpoint)
+                upload_item = {
+                    "local_path": destination,
+                    "destination_path": sink_path,
+                    "format_name": fmt,
+                    "ordinal": position,
+                    "output_state": output_state,
+                    "file_state": state,
+                    "size_bytes": destination.stat().st_size,
+                }
+                nonlocal upload_reserved_bytes
+                with work_condition:
+                    upload_queue.append(upload_item)
+                    upload_reserved_bytes += upload_item["size_bytes"]
+                    work_condition.notify_all()
 
-                def record_upload_failure(error):
-                    with transfer_totals_lock:
-                        transfer_totals["upload_failures"] += 1
-                    with checkpoint_lock:
-                        output_state["upload"] = {"status": "failed", "hub_path": sink_path, "error": str(error)}
-                        state["status"] = "failed"
-                        state["error"] = f"upload {fmt}: {error}"
-                        atomic_json(checkpoint_path, checkpoint)
-
-                def do_upload_task():
-                    with checkpoint_lock:
-                        output_state["upload"] = {"status": "uploading", "hub_path": sink_path}
-                        atomic_json(checkpoint_path, checkpoint)
-                    if isinstance(uploader, HuggingFaceBatchUploader):
-                        try:
-                            upload = uploader.upload(destination, sink_path, format_name=fmt, ordinal=position)
-                        except Exception as error:
-                            record_upload_failure(error)
-                            raise
-                        if upload["status"] == "complete":
-                            apply_committed_batch(upload)
-                            safe_print(f"    committed batch: {upload['url']}", flush=True)
-                        else:
-                            with checkpoint_lock:
-                                output_state["upload"] = upload
-                                atomic_json(checkpoint_path, checkpoint)
-                            safe_print(f"    preuploaded: {sink_path}", flush=True)
-                    else:
-                        try:
-                            upload = upload_then_maybe_delete(
-                                uploader, destination, sink_path, args.delete_after_upload
-                            )
-                        except Exception as error:
-                            record_upload_failure(error)
-                            raise
-                        with checkpoint_lock:
-                            output_state["upload"] = upload
-                            output_state["local_deleted"] = upload["local_deleted"]
-                            atomic_json(checkpoint_path, checkpoint)
-                        safe_print(f"    uploaded: {upload['url']}", flush=True)
-
-                def upload_task():
-                    return run_adaptive_upload(do_upload_task, destination.stat().st_size)
-
-                pending_uploads.append(upload_executor.submit(upload_task))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.format_workers) as executor:
-            futures = [executor.submit(process_format, fmt, job) for fmt, job in jobs]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+        for fmt, job in jobs:
+            process_format(fmt, job)
         if not args.keep_downloads:
             raw.unlink(missing_ok=True)
             if "download" in state:
@@ -1434,23 +1406,19 @@ def main():
         state.pop("error", None)
         save_checkpoint()
 
-    transcode_slots = max(1, args.transcode_workers // max(1, len(formats)))
-    conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=transcode_slots)
-    conversion_futures = []
-
-    def submit_conversion(position, shard, raw, outputs, state):
+    def submit_conversion(position, shard, raw, outputs, state, reserved=False):
         source_name = shard["path"]
         state["status"] = "converting"
         state.pop("error", None)
         save_checkpoint()
-        conversion_futures.append(
-            conversion_executor.submit(process_downloaded_shard, position, shard, source_name, raw, outputs, state)
-        )
+        with work_condition:
+            conversion_queue.append((position, shard, source_name, raw, outputs, state, reserved))
+            work_condition.notify_all()
 
     # Admit resumable local sources immediately. Network downloads below are admitted in
     # completion order, so one slow low-ordinal shard cannot strand ready CPU work.
     positions = {shard["path"]: position for position, shard in enumerate(selection, 1)}
-    shards_by_name = {shard["path"]: shard for shard in selection}
+    missing_names = {shard["path"] for shard in missing_shards}
     for position, shard in enumerate(selection, 1):
         source_name = shard["path"]
         raw, outputs = shard_paths(shard)
@@ -1477,7 +1445,7 @@ def main():
                 flush=True,
             )
             continue
-        if source_name not in download_futures and not shard_needs_download(shard):
+        if source_name not in missing_names and not shard_needs_download(shard):
             submit_conversion(position, shard, raw, outputs, state)
 
     def status_snapshot():
@@ -1490,6 +1458,17 @@ def main():
         preuploaded = sum(output.get("upload", {}).get("status") == "preuploaded" for output in outputs)
         with transfer_totals_lock:
             totals = dict(transfer_totals)
+        with work_condition:
+            queue_counts = {
+                "download": len(download_queue),
+                "convert": len(conversion_queue),
+                "upload": len(upload_queue),
+            }
+            active_counts = dict(active_work)
+            reserved_download_bytes = download_reserved_bytes
+            reserved_upload_bytes = upload_reserved_bytes
+            current_download_batch = download_batch_size
+            current_upload_batch = upload_batch_size
         elapsed = max(time.monotonic() - pipeline_started, 0.001)
         conversion_source_bytes = sum(
             state["size"]
@@ -1500,23 +1479,21 @@ def main():
         return {
             "queues": {
                 "download": {
-                    "waiting_items": len(missing_shards) - missing_index,
-                    "active_items": len(download_futures),
-                    "reserved_bytes": sum(download_sizes.values()),
+                    "waiting_items": queue_counts["download"],
+                    "active_items": active_counts["download"],
+                    "reserved_bytes": reserved_download_bytes,
+                    "batch_size": current_download_batch,
                 },
                 "transcode": {
-                    "waiting_items": sum(not future.running() and not future.done() for future in conversion_futures),
-                    "active_items": sum(future.running() for future in conversion_futures),
-                    "succeeded_items": sum(
-                        future.done() and future.exception() is None for future in conversion_futures
-                    ),
-                    "active_cpu_slots": args.transcode_workers - VX_CPU_SLOTS.qsize(),
+                    "waiting_items": queue_counts["convert"],
+                    "active_items": active_counts["convert"],
+                    "active_cpu_slots": len(cpu_slots) - VX_CPU_SLOTS.qsize(),
                 },
                 "upload": {
-                    "waiting_items": sum(not future.running() and not future.done() for future in pending_uploads),
-                    "active_items": upload_active,
-                    "succeeded_items": sum(future.done() and future.exception() is None for future in pending_uploads),
-                    "concurrency": upload_concurrency,
+                    "waiting_items": queue_counts["upload"],
+                    "active_items": active_counts["upload"],
+                    "reserved_bytes": reserved_upload_bytes,
+                    "batch_size": current_upload_batch,
                 },
             },
             "progress": {
@@ -1544,59 +1521,236 @@ def main():
 
     status = LiveStatus(args.output_dir / "status.json", args.status_interval, status_snapshot)
     status.start()
-    try:
-        for source_name, completed in completed_futures(download_futures):
-            download_sizes.pop(source_name)
-            shard = shards_by_name[source_name]
-            raw, outputs = shard_paths(shard)
-            state = checkpoint["files"][source_name]
-            try:
-                downloaded_path, download_seconds = completed.result()
-                if downloaded_path.resolve() != raw.resolve():
-                    raise RuntimeError(f"Hub download returned unexpected path: {downloaded_path}")
-                state["download"] = {
-                    "status": "complete",
-                    "path": str(raw),
-                    "size_bytes": shard["size"],
-                    "seconds": download_seconds,
+
+    def claim_batch(queue, maximum_files, maximum_bytes, size):
+        batch = []
+        batch_bytes = 0
+        while queue and len(batch) < maximum_files:
+            item = queue[0]
+            item_bytes = size(item)
+            if batch and batch_bytes + item_bytes > maximum_bytes:
+                break
+            batch.append(queue.popleft())
+            batch_bytes += item_bytes
+            if batch_bytes >= maximum_bytes:
+                break
+        return batch, batch_bytes
+
+    def run_upload_batch(batch):
+        payload = [
+            {key: item[key] for key in ("local_path", "destination_path", "format_name", "ordinal")} for item in batch
+        ]
+        with checkpoint_lock:
+            for item in batch:
+                item["output_state"]["upload"] = {
+                    "status": "uploading",
+                    "hub_path": item["destination_path"],
                 }
-                rate = shard["size"] / max(download_seconds, 0.001)
-                download_concurrency = adapt_concurrency(
-                    download_concurrency, args.download_max_concurrency, recent_download_rates, rate
+            atomic_json(checkpoint_path, checkpoint)
+        if isinstance(uploader, HuggingFaceBatchUploader):
+            results = uploader.upload_batch(payload)
+        else:
+            results = [
+                upload_then_maybe_delete(
+                    uploader,
+                    item["local_path"],
+                    item["destination_path"],
+                    args.delete_after_upload,
                 )
-                with transfer_totals_lock:
-                    transfer_totals["download_bytes"] += shard["size"]
-                    transfer_totals["download_seconds"] += download_seconds
-                submit_conversion(positions[source_name], shard, raw, outputs, state)
-                safe_print(
-                    f"[{positions[source_name]}/{len(selection)}] downloaded {source_name} in {download_seconds:.1f}s",
-                    flush=True,
-                )
-            except Exception as error:
-                with transfer_totals_lock:
-                    transfer_totals["download_failures"] += 1
-                state["status"] = "failed"
-                state["error"] = f"download: {error}"
-                save_checkpoint()
-                raise
-            fill_download_window()
-            while len(pending_uploads) >= args.upload_buffer_files:
-                pending_uploads.popleft().result()
+                for item in batch
+            ]
+        for item, result in zip(batch, results, strict=True):
+            if result["status"] == "complete" and isinstance(uploader, HuggingFaceBatchUploader):
+                apply_committed_batch(result)
+                safe_print(f"    committed batch: {result['url']}", flush=True)
+            elif result["status"] == "preuploaded":
+                with checkpoint_lock:
+                    item["output_state"]["upload"] = result
+                    atomic_json(checkpoint_path, checkpoint)
+                safe_print(f"    preuploaded: {item['destination_path']}", flush=True)
+            else:
+                with checkpoint_lock:
+                    item["output_state"]["upload"] = result
+                    item["output_state"]["local_deleted"] = result.get("local_deleted", False)
+                    atomic_json(checkpoint_path, checkpoint)
+                safe_print(f"    uploaded: {result['url']}", flush=True)
+
+    def worker_loop():
+        nonlocal download_reserved_files, download_reserved_bytes, upload_reserved_bytes
+        nonlocal download_batch_size, upload_batch_size
+        while True:
+            with work_condition:
+                while True:
+                    if worker_failure:
+                        return
+                    upload_high = upload_queue and (
+                        len(upload_queue) >= args.upload_buffer_files
+                        or upload_reserved_bytes >= args.upload_buffer_size
+                    )
+                    download_has_capacity = download_queue and (
+                        download_reserved_files == 0
+                        or (
+                            download_reserved_files < args.download_buffer_files
+                            and download_reserved_bytes + download_queue[0]["size"] <= args.download_buffer_size
+                        )
+                    )
+                    stage = choose_work_stage(
+                        upload_waiting=bool(upload_queue),
+                        upload_high=bool(upload_high),
+                        download_available=bool(download_has_capacity),
+                        convert_waiting=bool(conversion_queue),
+                        active=any(active_work.values()),
+                    )
+                    if stage == "done":
+                        return
+                    if stage is None:
+                        work_condition.wait()
+                        continue
+
+                    if stage == "download":
+                        remaining_files = max(1, args.download_buffer_files - download_reserved_files)
+                        remaining_bytes = max(1, args.download_buffer_size - download_reserved_bytes)
+                        batch, batch_bytes = claim_batch(
+                            download_queue,
+                            min(download_batch_size, remaining_files),
+                            remaining_bytes,
+                            lambda shard: shard["size"],
+                        )
+                        download_reserved_files += len(batch)
+                        download_reserved_bytes += batch_bytes
+                    elif stage == "upload":
+                        batch, batch_bytes = claim_batch(
+                            upload_queue,
+                            upload_batch_size,
+                            args.upload_buffer_size,
+                            lambda item: item["size_bytes"],
+                        )
+                    else:
+                        batch = [conversion_queue.popleft()]
+                        batch_bytes = batch[0][1]["size"]
+                    active_work[stage] += 1
+                    break
+
+            started = time.monotonic()
+            try:
+                if stage == "download":
+                    results = download_shard_batch(
+                        args.repo,
+                        source_commit,
+                        batch,
+                        args.output_dir / "downloads",
+                        args.hub_attempts,
+                        args.hub_timeout,
+                    )
+                    elapsed = max(time.monotonic() - started, 0.001)
+                    with transfer_totals_lock:
+                        transfer_totals["download_bytes"] += batch_bytes
+                        transfer_totals["download_seconds"] += elapsed
+                    with work_condition:
+                        download_batch_size = adapt_concurrency(
+                            download_batch_size,
+                            args.download_max_concurrency,
+                            recent_download_rates,
+                            batch_bytes / elapsed,
+                        )
+                    for shard, downloaded_path, download_seconds in results:
+                        source_name = shard["path"]
+                        raw, outputs = shard_paths(shard)
+                        if downloaded_path.resolve() != raw.resolve():
+                            raise RuntimeError(f"Hub download returned unexpected path: {downloaded_path}")
+                        state = checkpoint["files"][source_name]
+                        state["download"] = {
+                            "status": "complete",
+                            "path": str(raw),
+                            "size_bytes": shard["size"],
+                            "seconds": download_seconds,
+                        }
+                        save_checkpoint()
+                        submit_conversion(positions[source_name], shard, raw, outputs, state, reserved=True)
+                        safe_print(
+                            f"[{positions[source_name]}/{len(selection)}] downloaded {source_name} "
+                            f"in {download_seconds:.1f}s",
+                            flush=True,
+                        )
+                elif stage == "convert":
+                    process_downloaded_shard(*batch[0][:-1])
+                    if batch[0][-1]:
+                        with work_condition:
+                            download_reserved_files -= 1
+                            download_reserved_bytes -= batch_bytes
+                else:
+                    run_upload_batch(batch)
+                    elapsed = max(time.monotonic() - started, 0.001)
+                    with transfer_totals_lock:
+                        transfer_totals["upload_bytes"] += batch_bytes
+                        transfer_totals["upload_seconds"] += elapsed
+                    with work_condition:
+                        upload_batch_size = adapt_concurrency(
+                            upload_batch_size,
+                            args.upload_max_concurrency,
+                            recent_upload_rates,
+                            batch_bytes / elapsed,
+                        )
+                        upload_reserved_bytes -= batch_bytes
+            except Exception as error:  # noqa: BLE001 - worker boundary records every failure
+                if stage in ("download", "upload"):
+                    with transfer_totals_lock:
+                        transfer_totals[f"{stage}_failures"] += 1
+                if stage == "download":
+                    with checkpoint_lock:
+                        for shard in batch:
+                            state = checkpoint["files"][shard["path"]]
+                            state["status"] = "failed"
+                            state["error"] = f"download: {error}"
+                        atomic_json(checkpoint_path, checkpoint)
+                elif stage == "convert":
+                    with checkpoint_lock:
+                        state = batch[0][5]
+                        state["status"] = "failed"
+                        state.setdefault("error", f"conversion: {error}")
+                        atomic_json(checkpoint_path, checkpoint)
+                else:
+                    with checkpoint_lock:
+                        for item in batch:
+                            item["output_state"]["upload"] = {
+                                "status": "failed",
+                                "hub_path": item["destination_path"],
+                                "error": str(error),
+                            }
+                            item["file_state"]["status"] = "failed"
+                            item["file_state"]["error"] = f"upload {item['format_name']}: {error}"
+                        atomic_json(checkpoint_path, checkpoint)
+                with work_condition:
+                    if stage == "download":
+                        download_reserved_files -= len(batch)
+                        download_reserved_bytes -= batch_bytes
+                    elif stage == "convert" and batch[0][-1]:
+                        download_reserved_files -= 1
+                        download_reserved_bytes -= batch_bytes
+                    elif stage == "upload":
+                        upload_reserved_bytes -= batch_bytes
+                    worker_failure.append(error)
+                    work_condition.notify_all()
+            finally:
+                with work_condition:
+                    active_work[stage] -= 1
+                    work_condition.notify_all()
+
+    try:
+        worker_count = args.workers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            workers = [executor.submit(worker_loop) for _ in range(worker_count)]
+            for worker in workers:
+                worker.result()
+        if worker_failure:
+            raise worker_failure[0]
+        if isinstance(uploader, HuggingFaceBatchUploader):
+            for final_batch in uploader.flush():
+                apply_committed_batch(final_batch)
+                safe_print(f"    committed final batch: {final_batch['url']}", flush=True)
+        write_reports(checkpoint, args.output_dir, selection)
     finally:
-        status.write()
-    for future in concurrent.futures.as_completed(conversion_futures):
-        future.result()
-    conversion_executor.shutdown(wait=True, cancel_futures=True)
-    download_executor.shutdown(wait=True, cancel_futures=True)
-    for future in pending_uploads:
-        future.result()
-    upload_executor.shutdown(wait=True, cancel_futures=True)
-    if isinstance(uploader, HuggingFaceBatchUploader):
-        for final_batch in uploader.flush():
-            apply_committed_batch(final_batch)
-            safe_print(f"    committed final batch: {final_batch['url']}", flush=True)
-    write_reports(checkpoint, args.output_dir, selection)
-    status.close()
+        status.close()
     return 0
 
 

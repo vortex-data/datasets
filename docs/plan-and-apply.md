@@ -123,6 +123,19 @@ During execution, the script:
 4. preuploads and commits outputs in the planned batches;
 5. writes checkpoint, status, and metrics files under `--output-dir`.
 
+All three stages share one `--workers` pool. A worker can claim any kind of
+work. The scheduler drains an upload queue at its high-water mark, otherwise
+refills the download buffer, then handles ready uploads, then converts a ready
+source shard. Queue claims are atomic, so two workers cannot process the same
+file.
+
+Downloads and uploads are real multi-file operations. Their batch sizes start
+at the configured initial value, grow while aggregate throughput improves, and
+back off after a significant regression. File and byte limits cap every claim.
+Upload preupload batches remain separate from planned commit batches: files may
+transfer together, but a commit is created only when all members of its planned
+batch are ready.
+
 `--delete-after-upload` removes a local output only after its upload is
 committed successfully. Source downloads are removed after conversion unless
 `--keep-downloads` is set.
@@ -165,13 +178,13 @@ have not yet been committed. They are reusable and avoid repeated conversion.
 
 The most useful apply controls are:
 
+- `--workers` sets the size of the unified worker pool.
 - `--download-initial-concurrency` and `--download-max-concurrency` control the
-  adaptive download worker range.
+  adaptive number of files in each download batch.
 - `--download-buffer-files` and `--download-buffer-size` bound admitted source
   downloads.
-- `--transcode-workers` bounds CPU slots used by `vx` processes.
-- `--format-workers` bounds formats converted concurrently for each shard.
-- `--upload-workers` and `--upload-max-concurrency` control adaptive uploads.
+- `--upload-workers` and `--upload-max-concurrency` control the adaptive number
+  of files in each upload batch.
 - `--upload-buffer-files` and `--upload-buffer-size` bound pending output work.
 - `--xet-cache`, `--xet-range-gets`, and `--xet-high-performance` tune Xet.
 - `--status-interval` controls how frequently live status is written.

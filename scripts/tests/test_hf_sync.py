@@ -11,6 +11,7 @@ import types
 import unittest
 from collections import deque
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).parents[1] / "hf-sync.py"
 SPEC = importlib.util.spec_from_file_location("hf_sync", SCRIPT)
@@ -19,6 +20,29 @@ SPEC.loader.exec_module(MODULE)
 
 
 class LocalCopyUploaderTest(unittest.TestCase):
+    def test_unified_worker_priority(self):
+        choose = MODULE.choose_work_stage
+        common = {"upload_waiting": True, "download_available": True, "convert_waiting": True, "active": True}
+
+        self.assertEqual(choose(upload_high=True, **common), "upload")
+        self.assertEqual(choose(upload_high=False, **common), "download")
+        self.assertEqual(
+            choose(upload_waiting=True, upload_high=False, download_available=False, convert_waiting=True, active=True),
+            "upload",
+        )
+        self.assertEqual(
+            choose(
+                upload_waiting=False, upload_high=False, download_available=False, convert_waiting=True, active=True
+            ),
+            "convert",
+        )
+        self.assertEqual(
+            choose(
+                upload_waiting=False, upload_high=False, download_available=False, convert_waiting=False, active=False
+            ),
+            "done",
+        )
+
     def test_adaptive_concurrency_increases_holds_and_backs_off(self):
         rates = deque(maxlen=4)
 
@@ -30,21 +54,6 @@ class LocalCopyUploaderTest(unittest.TestCase):
         MODULE.adapt_concurrency(concurrency, 4, rates, 100)
         concurrency = MODULE.adapt_concurrency(concurrency, 4, rates, 50)
         self.assertEqual(concurrency, 1)
-
-    def test_completed_downloads_do_not_wait_for_slow_first_item(self):
-        def finish(name, delay):
-            time.sleep(delay)
-            return name
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                "slow-first": executor.submit(finish, "slow-first", 0.15),
-                "fast-second": executor.submit(finish, "fast-second", 0.01),
-            }
-            completion_order = [name for name, _ in MODULE.completed_futures(futures)]
-
-        self.assertEqual(completion_order, ["fast-second", "slow-first"])
-        self.assertEqual(futures, {})
 
     def test_live_status_is_atomic_and_marks_final_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -287,12 +296,14 @@ class LocalCopyUploaderTest(unittest.TestCase):
         class FakeApi:
             def __init__(self):
                 self.preuploads = []
+                self.preupload_calls = 0
                 self.commits = []
 
             def dataset_info(self, repo, revision=None, timeout=None):
                 return types.SimpleNamespace(sha="parent")
 
             def preupload_lfs_files(self, repo, additions, **kwargs):
+                self.preupload_calls += 1
                 self.preuploads.extend(additions)
 
             def create_commit(self, repo, operations, **kwargs):
@@ -310,8 +321,22 @@ class LocalCopyUploaderTest(unittest.TestCase):
                 path.write_bytes(bytes([ordinal]))
                 paths.append(path)
 
-            pending = uploader.upload(paths[0], "vortex/1.vortex", format_name="vortex", ordinal=1)
-            committed = uploader.upload(paths[1], "vortex/2.vortex", format_name="vortex", ordinal=2)
+            pending, committed = uploader.upload_batch(
+                [
+                    {
+                        "local_path": paths[0],
+                        "destination_path": "vortex/1.vortex",
+                        "format_name": "vortex",
+                        "ordinal": 1,
+                    },
+                    {
+                        "local_path": paths[1],
+                        "destination_path": "vortex/2.vortex",
+                        "format_name": "vortex",
+                        "ordinal": 2,
+                    },
+                ]
+            )
             compact = uploader.upload(paths[2], "vortex-compact/3.vortex", format_name="vortex-compact", ordinal=3)
             final = uploader.flush()
 
@@ -320,6 +345,7 @@ class LocalCopyUploaderTest(unittest.TestCase):
             self.assertEqual(compact["status"], "preuploaded")
             self.assertEqual(final[0]["commit_message"], "Upload vortex-compact files 3-3 of 3")
             self.assertEqual(len(api.preuploads), 3)
+            self.assertEqual(api.preupload_calls, 2)
             self.assertEqual(len(api.commits), 2)
             self.assertEqual(api.commits[0][1]["parent_commit"], "parent")
             self.assertEqual(api.commits[1][1]["parent_commit"], "commit-1")
@@ -407,6 +433,28 @@ class LocalCopyUploaderTest(unittest.TestCase):
         self.assertTrue(MODULE.fits_download_buffer(0, 20, 10))
         self.assertTrue(MODULE.fits_download_buffer(4, 6, 10))
         self.assertFalse(MODULE.fits_download_buffer(4, 7, 10))
+
+    def test_download_batch_uses_one_concurrent_snapshot_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shards = [
+                {"path": "data/a.parquet", "size": 1, "sha256": None},
+                {"path": "data/b.parquet", "size": 2, "sha256": None},
+            ]
+            for shard in shards:
+                path = root / shard["path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * shard["size"])
+
+            with mock.patch("huggingface_hub.snapshot_download", return_value=str(root)) as download:
+                results = MODULE.download_shard_batch(
+                    "owner/source", "commit", shards, root, attempts=1, etag_timeout=30
+                )
+
+            self.assertEqual([result[0] for result in results], shards)
+            self.assertEqual(download.call_count, 1)
+            self.assertEqual(download.call_args.kwargs["allow_patterns"], ["data/a.parquet", "data/b.parquet"])
+            self.assertEqual(download.call_args.kwargs["max_workers"], 2)
 
     def test_resume_reuses_local_outputs_and_skips_committed_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -580,6 +628,115 @@ class LocalCopyUploaderTest(unittest.TestCase):
                             for index in range(metadata.num_row_groups)
                         )
                     )
+
+    def test_unified_pool_runs_download_convert_upload_pipeline(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_dir = root / "run"
+            sink = root / "sink"
+            shard = {"path": "data/a.parquet", "size": 0, "sha256": None}
+            plan = {
+                "source": {
+                    "repo": "owner/source",
+                    "requested_revision": "main",
+                    "revision": "source-commit",
+                    "prefix": "data",
+                    "include": "*.parquet",
+                    "filters": [],
+                },
+                "destination": {
+                    "repo": "owner/destination",
+                    "requested_revision": "main",
+                    "revision": "destination-commit",
+                    "prefix": "",
+                },
+                "selection": {"mode": "all", "limit": 1, "target_bytes": 1, "seed": 0},
+                "formats": ["parquet-zstd6"],
+                "work_chunks": [
+                    {
+                        "ordinal": 1,
+                        "source": shard,
+                        "actions": [
+                            {
+                                "action": "create",
+                                "format": "parquet-zstd6",
+                                "destination_path": "parquet-zstd6/data/a.parquet",
+                                "upload_batch": "parquet-zstd6-1-1",
+                            }
+                        ],
+                    }
+                ],
+                "upload_batches": [
+                    {
+                        "id": "parquet-zstd6-1-1",
+                        "format": "parquet-zstd6",
+                        "start": 1,
+                        "end": 1,
+                        "total_files": 1,
+                        "commit_message": "fixture",
+                        "source_ordinals": [1],
+                        "destination_paths": ["parquet-zstd6/data/a.parquet"],
+                    }
+                ],
+            }
+            source_fixture = root / "source.parquet"
+            pq.write_table(pa.table({"value": [1, 2, 3]}), source_fixture)
+            shard["size"] = source_fixture.stat().st_size
+
+            args = types.SimpleNamespace(
+                command="apply",
+                plan_file=root / "plan.json",
+                output_dir=output_dir,
+                vx=Path("/bin/true"),
+                workers=2,
+                format_workers=1,
+                transcode_workers=None,
+                shard_workers=1,
+                download_initial_concurrency=1,
+                download_max_concurrency=2,
+                download_buffer_files=2,
+                download_buffer_size=10_000_000,
+                upload_workers=1,
+                upload_max_concurrency=2,
+                upload_local_dir=sink,
+                upload_buffer_files=2,
+                upload_buffer_size=10_000_000,
+                upload_batch_files=2,
+                hub_attempts=1,
+                hub_timeout=1,
+                xet_range_gets=1,
+                xet_cache=root / "xet",
+                xet_high_performance=False,
+                keep_downloads=False,
+                delete_after_upload=False,
+                status_interval=0.01,
+                detached=True,
+            )
+
+            def fake_download(_repo, _revision, shards, download_root, _attempts, _timeout):
+                destination = download_root / shards[0]["path"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(source_fixture.read_bytes())
+                return [(shards[0], destination, 0.01)]
+
+            with (
+                mock.patch.object(MODULE, "parse_args", return_value=args),
+                mock.patch.object(MODULE, "load_action_plan", return_value=plan),
+                mock.patch.object(MODULE, "require_xet_repository"),
+                mock.patch.object(MODULE, "download_shard_batch", side_effect=fake_download),
+            ):
+                result = MODULE.main()
+
+            self.assertEqual(result, 0)
+            uploaded = sink / "parquet-zstd6/data/a.parquet"
+            self.assertTrue(uploaded.is_file())
+            self.assertTrue(json.loads((output_dir / "status.json").read_text())["final"])
 
 
 if __name__ == "__main__":
