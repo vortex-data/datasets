@@ -31,6 +31,10 @@ HF_TOKEN=... uv run --project scripts scripts/hf-sync.py plan \
 
 Review or edit `plan.json` before applying it.
 
+See [Planning and applying a dataset conversion](docs/plan-and-apply.md) for a
+complete walkthrough, plan review checklist, resume behavior, and operational
+tuning guidance.
+
 ## Apply a plan
 
 ```sh
