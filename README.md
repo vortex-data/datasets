@@ -1,68 +1,52 @@
 # vortex-data/datasets
 
-Tooling for mirroring external Hugging Face Parquet datasets into vortex-data
-repositories as Vortex (and re-compressed Parquet) files.
+Tools for converting physical Parquet shards in Hugging Face dataset
+repositories to Vortex or recompressed Parquet files.
 
-## `scripts/hf-sync.py`
+## Setup
 
-Syncs a list of external Hugging Face dataset repositories into a vortex-data
-destination repository, in **two explicit steps with an inspectable plan file
-in between**:
+The repository is a `uv` workspace. Install the script dependencies with:
 
 ```sh
-# Step 1: diff every source against the destination and write the work plan.
-HF_TOKEN=... scripts/hf-sync.py plan --sources sources.json \
-    --upload-repo vortex-data/mirror --plan plan.json
-
-# Inspect (or trim/edit) plan.json — it lists every file that will be synced,
-# the formats it is missing, and the exact destination paths.
-
-# Step 2: execute the plan — download, convert, upload.
-HF_TOKEN=... scripts/hf-sync.py run --plan plan.json \
-    --vx /path/to/vx --delete-after-upload
+uv sync --project scripts
 ```
 
-`plan` resolves each source to an immutable commit, maps every selected Parquet
-shard to a deterministic destination path that keeps the source file's name:
+The Vortex output formats also require a `vx` binary built from Vortex with
+the `unstable_encodings` feature.
 
-```
-<upload-prefix>/<format>/<source-repo-slug>/<source path>.{vortex,parquet}
-```
+## Plan a conversion
 
-and diffs that path against the destination repository's listing. Pairs already
-present in the destination are recorded under `already_present`; the rest become
-work chunks — one per source file, listing the formats still missing and their
-destination paths. Nothing is transferred by `plan`.
-
-`run` executes only what the plan contains: each chunk is downloaded
-(Xet-accelerated), converted to its missing formats, and uploaded in batched
-Hub commits. Runs are checkpointed per source repository under `--output-dir`
-and are resumable after interruption; deleting entries from the plan before
-`run` skips them entirely.
-
-### Sources
-
-Sources come from a JSON file (see [`sources.example.json`](sources.example.json))
-and/or a single `--repo`:
+Planning resolves the source and destination to immutable revisions, discovers
+the selected Parquet shards, and writes an action plan without transferring
+data:
 
 ```sh
-scripts/hf-sync.py plan --repo HuggingFaceFW/fineweb --prefix data \
-    --filter 'sample/10BT/*' --upload-repo vortex-data/mirror
+HF_TOKEN=... uv run --project scripts scripts/hf-sync.py plan \
+    --repo HuggingFaceFW/fineweb \
+    --revision main \
+    --prefix sample/10BT \
+    --upload-repo vortex-data/fineweb \
+    --plan-file plan.json
 ```
 
-Per-source keys: `repo` (required), `revision`, `prefix`, `include`, `filters`,
-`mode` (`all` | `first` | `sample`), `limit`, `target_size`, `seed`.
+Review or edit `plan.json` before applying it.
 
-### Requirements
-
-- `huggingface_hub` with `hf-xet` (all repositories must be Xet-enabled)
-- `pyarrow` for the `parquet-zstd6` output
-- a `vx` binary (build `vortex-tui` with `unstable_encodings`) for the
-  `vortex` and `vortex-compact` outputs
-- `HF_TOKEN` with write access to the destination repository
-
-### Tests
+## Apply a plan
 
 ```sh
-python -m unittest discover -s scripts/tests -v
+HF_TOKEN=... uv run --project scripts scripts/hf-sync.py apply \
+    plan.json --vx /path/to/vx
+```
+
+The apply step uses bounded download, conversion, and upload pipelines. It
+checkpoints progress under `--output-dir`, supports resuming interrupted runs,
+and only removes local outputs after successful upload when
+`--delete-after-upload` is set.
+
+Run `uv run --project scripts scripts/hf-sync.py --help` for all options.
+
+## Tests
+
+```sh
+uv run --project scripts python -m unittest discover -s scripts/tests -v
 ```
