@@ -778,87 +778,121 @@ def metric(source_name, fmt, path, input_size, seconds):
     }
 
 
-def add_selection_arguments(parser):
-    parser.add_argument(
+def add_hub_arguments(parser):
+    hub = parser.add_argument_group("Hugging Face Hub")
+    hub.add_argument("--hub-attempts", type=int, default=8, help="retry attempts for each Hub API call")
+    hub.add_argument("--hub-timeout", type=int, default=30, help="Hub request timeout in seconds")
+
+
+def add_plan_arguments(parser):
+    source = parser.add_argument_group("source")
+    source.add_argument("--repo", required=True, help="source Hugging Face dataset repository")
+    source.add_argument("--revision", required=True, help="source branch, tag, or commit (resolved before planning)")
+    source.add_argument("--prefix", required=True, help="source repository folder; use / to scan the repository root")
+    source.add_argument(
+        "--include", default="*.parquet", help="glob matched against paths below --prefix (default: *.parquet)"
+    )
+    source.add_argument(
+        "--filter", action="append", default=[], help="repeatable full repository-path glob, e.g. 'sample/10BT/*'"
+    )
+
+    selection = parser.add_argument_group("shard selection")
+    selection.add_argument(
         "--mode",
         choices=("sample", "first", "all"),
         default="sample",
         help="sample evenly, take the first --limit shards, or stream every shard",
     )
-    parser.add_argument("--limit", type=int, default=10, help="number of ordered shards selected by --mode first")
-    parser.add_argument("--target-size", type=parse_size, default=DEFAULT_TARGET_BYTES)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--repo", required=True, help="source Hugging Face dataset repository")
-    parser.add_argument("--revision", required=True, help="source branch, tag, or commit (resolved before planning)")
-    parser.add_argument("--prefix", required=True, help="source repository folder; use / to scan the repository root")
-    parser.add_argument(
-        "--include", default="*.parquet", help="glob matched against paths below --prefix (default: *.parquet)"
+    selection.add_argument("--limit", type=int, default=10, help="number of ordered shards selected by --mode first")
+    selection.add_argument(
+        "--target-size",
+        type=parse_size,
+        default=DEFAULT_TARGET_BYTES,
+        help="approximate total selected by --mode sample",
     )
-    parser.add_argument(
-        "--filter", action="append", default=[], help="repeatable full repository-path glob, e.g. 'sample/10BT/*'"
-    )
-    parser.add_argument(
+    selection.add_argument("--seed", type=int, default=0, help="sampling seed for --mode sample")
+
+    destination = parser.add_argument_group("destination")
+    destination.add_argument("--upload-repo", required=True, help="destination Hugging Face dataset repository")
+    destination.add_argument("--upload-revision", default="main", help="destination branch (default: main)")
+    destination.add_argument("--upload-prefix", default="", help="destination folder that receives per-format outputs")
+    destination.add_argument(
         "--formats",
         default="parquet-zstd6,vortex,vortex-compact",
         help="comma-separated outputs: parquet-zstd6,vortex,vortex-compact",
     )
-    parser.add_argument("--upload-repo", required=True, help="destination Hugging Face dataset repository")
-    parser.add_argument("--upload-revision", default="main")
-    parser.add_argument("--upload-prefix", default="")
-    parser.add_argument(
+
+    batching = parser.add_argument_group("commit batching")
+    batching.add_argument(
         "--upload-batch-files", type=int, default=100, help="maximum actions in each planned Hugging Face commit"
     )
-    parser.add_argument(
+    batching.add_argument(
         "--upload-batch-size",
         type=parse_size,
         default=100_000_000_000,
         help="maximum planned source bytes represented by one target commit",
     )
-    parser.add_argument("--hub-attempts", type=int, default=8)
-    parser.add_argument("--hub-timeout", type=int, default=30)
+
+    add_hub_arguments(parser)
+    parser.add_argument("--plan-file", type=Path, required=True, help="where to write the JSON action plan")
 
 
-def add_operational_arguments(parser):
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--vx", type=Path, default=Path("target/release/vx"))
-    parser.add_argument("--workers", type=int, help="workers in the unified download/upload/convert pool")
-    parser.add_argument("--format-workers", type=int, default=3, help="deprecated; formats run sequentially per job")
-    parser.add_argument(
-        "--transcode-workers",
-        type=int,
-        help="deprecated alias for --workers",
+def add_apply_arguments(parser):
+    execution = parser.add_argument_group("execution")
+    execution.add_argument("--output-dir", type=Path, default=DEFAULT_DATA_DIR, help="local working directory")
+    execution.add_argument(
+        "--vx", type=Path, default=Path("target/release/vx"), help="vx binary used for Vortex output"
     )
-    parser.add_argument("--shard-workers", type=int, default=2, help="deprecated download batch-size alias")
-    parser.add_argument("--download-initial-concurrency", type=int, help="initial adaptive download batch size")
-    parser.add_argument("--download-max-concurrency", type=int, default=8, help="maximum download batch size")
-    parser.add_argument("--download-buffer-files", type=int, default=100)
-    parser.add_argument("--download-buffer-size", type=parse_size, default=DEFAULT_DOWNLOAD_BUFFER_BYTES)
-    parser.add_argument("--upload-workers", type=int, default=2, help="initial adaptive upload batch size")
-    parser.add_argument("--upload-max-concurrency", type=int, default=8, help="maximum upload batch size")
-    parser.add_argument("--upload-local-dir", type=Path, help="copy outputs to a local sink instead of Hugging Face")
-    parser.add_argument("--upload-buffer-files", type=int, default=100)
-    parser.add_argument("--upload-batch-files", type=int, default=100)
-    parser.add_argument("--upload-buffer-size", type=parse_size, default=DEFAULT_UPLOAD_BUFFER_BYTES)
-    parser.add_argument("--hub-attempts", type=int, default=8)
-    parser.add_argument("--hub-timeout", type=int, default=30)
-    parser.add_argument("--xet-range-gets", type=int, default=4)
-    parser.add_argument("--xet-cache", type=Path, default=DEFAULT_XET_CACHE)
-    parser.add_argument("--xet-high-performance", action="store_true")
-    parser.add_argument("--keep-downloads", action="store_true")
-    parser.add_argument("--delete-after-upload", action="store_true")
-    parser.add_argument("--status-interval", type=float, default=DEFAULT_STATUS_INTERVAL)
-    parser.add_argument("--detached", action="store_true")
+    execution.add_argument(
+        "--workers", type=int, help="workers in the unified download/upload/convert pool (default: CPU count)"
+    )
+    execution.add_argument("--status-interval", type=float, default=DEFAULT_STATUS_INTERVAL)
+    execution.add_argument("--detached", action="store_true", help="assume no interactive terminal is attached")
+
+    download = parser.add_argument_group("download tuning")
+    download.add_argument(
+        "--download-initial-concurrency", type=int, default=2, help="initial adaptive download batch size"
+    )
+    download.add_argument("--download-max-concurrency", type=int, default=8, help="maximum download batch size")
+    download.add_argument(
+        "--download-buffer-files", type=int, default=100, help="downloaded files buffered ahead of conversion"
+    )
+    download.add_argument(
+        "--download-buffer-size",
+        type=parse_size,
+        default=DEFAULT_DOWNLOAD_BUFFER_BYTES,
+        help="downloaded bytes buffered ahead of conversion",
+    )
+    download.add_argument("--keep-downloads", action="store_true", help="keep source files after conversion")
+
+    upload = parser.add_argument_group("upload tuning")
+    upload.add_argument("--upload-workers", type=int, default=2, help="initial adaptive upload batch size")
+    upload.add_argument("--upload-max-concurrency", type=int, default=8, help="maximum upload batch size")
+    upload.add_argument("--upload-buffer-files", type=int, default=100, help="converted files buffered ahead of upload")
+    upload.add_argument(
+        "--upload-buffer-size",
+        type=parse_size,
+        default=DEFAULT_UPLOAD_BUFFER_BYTES,
+        help="converted bytes buffered ahead of upload",
+    )
+    upload.add_argument("--upload-local-dir", type=Path, help="copy outputs to a local sink instead of Hugging Face")
+    upload.add_argument("--delete-after-upload", action="store_true", help="delete converted files after upload")
+
+    add_hub_arguments(parser)
+    xet = parser.add_argument_group("Xet transport")
+    xet.add_argument("--xet-range-gets", type=int, default=4, help="concurrent Xet range requests per download")
+    xet.add_argument("--xet-cache", type=Path, default=DEFAULT_XET_CACHE, help="Xet chunk cache directory")
+    xet.add_argument("--xet-high-performance", action="store_true", help="enable the Xet high-performance profile")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     plan = commands.add_parser("plan", help="discover differences and write an action plan")
-    add_selection_arguments(plan)
-    plan.add_argument("--plan-file", type=Path, required=True)
+    add_plan_arguments(plan)
     apply = commands.add_parser("apply", help="execute a previously reviewed action plan")
-    apply.add_argument("plan_file", type=Path)
-    add_operational_arguments(apply)
+    apply.add_argument("plan_file", type=Path, help="action plan written by the plan command")
+    add_apply_arguments(apply)
     return parser.parse_args()
 
 
@@ -891,7 +925,7 @@ def create_action_plan(api, args):
     formats = parse_formats(args.formats)
     if args.upload_batch_files < 1 or args.upload_batch_files > 100:
         raise RuntimeError("--upload-batch-files must be between 1 and 100")
-    upload_batch_size = getattr(args, "upload_batch_size", 100_000_000_000)
+    upload_batch_size = args.upload_batch_size
     if upload_batch_size < 1:
         raise RuntimeError("--upload-batch-size must be positive")
     prefix = args.prefix.strip("/")
@@ -1067,18 +1101,10 @@ def main():
         return 0
     plan = load_action_plan(args.plan_file)
     selection = apply_plan_arguments(args, plan)
-    if args.format_workers < 1 or args.format_workers > 3:
-        raise RuntimeError("--format-workers must be between 1 and 3")
     if args.workers is None:
-        args.workers = args.transcode_workers or max(1, os.cpu_count() or 1)
-    elif args.transcode_workers is not None:
-        raise RuntimeError("use --workers or deprecated --transcode-workers, not both")
+        args.workers = max(1, os.cpu_count() or 1)
     if args.workers < 1:
         raise RuntimeError("--workers must be positive")
-    if args.shard_workers < 1:
-        raise RuntimeError("--shard-workers must be positive")
-    if args.download_initial_concurrency is None:
-        args.download_initial_concurrency = args.shard_workers
     if not 1 <= args.download_initial_concurrency <= args.download_max_concurrency:
         raise RuntimeError("download concurrency must satisfy 1 <= initial <= max")
     if args.download_buffer_size < 1:
@@ -1093,8 +1119,6 @@ def main():
         raise RuntimeError("--status-interval must be positive")
     if args.upload_buffer_files < 1:
         raise RuntimeError("--upload-buffer-files must be positive")
-    if args.upload_batch_files < 1 or args.upload_batch_files > 100:
-        raise RuntimeError("--upload-batch-files must be between 1 and 100")
     if args.upload_buffer_size < 1:
         raise RuntimeError("--upload-buffer-size must be positive")
     if args.hub_attempts < 1:
@@ -1181,7 +1205,7 @@ def main():
             api,
             args.upload_repo,
             args.upload_revision,
-            args.upload_batch_files,
+            100,  # commit batching is defined by the plan's upload_batches; this only bounds the no-plan fallback
             create_totals,
             args.hub_attempts,
             args.hub_timeout,
